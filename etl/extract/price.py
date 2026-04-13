@@ -1,16 +1,13 @@
 import yfinance as yf
 import pandas as pd
 
-def fetch_price(symbol: str, years: int = 3) -> pd.DataFrame:
-    df = yf.Ticker(symbol).history(period=f"{years}y")
-
+def fetch_price(symbol: str, years: int = 5) -> pd.DataFrame:
+    """Fetch OHLCV daily price history."""
+    df = yf.Ticker(symbol).history(period=f"{years}y", auto_adjust=True)
     if df is None or df.empty:
-        raise Exception("No price data")
-
+        raise Exception(f"No price data for {symbol}")
     df = df.reset_index()
-    df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
-
-    df.columns = ["date", "open", "high", "low", "close", "volume"]
-    df["date"] = pd.to_datetime(df["date"]).dt.date
-
-    return df
+    df["Date"] = pd.to_datetime(df["Date"]).dt.date
+    df = df.rename(columns={"Date": "date", "Open": "open", "High": "high",
+                             "Low": "low", "Close": "close", "Volume": "volume"})
+    return df[["date", "open", "high", "low", "close", "volume"]]
