@@ -126,12 +126,11 @@ def run_pipeline(symbol_yf: str = "ADANIPORTS.NS"):
             load_income(stmts["q_income"], symbol_nse, "quarterly")
 
         # Quarterly balance sheet — use extended (interpolated) version
-        q_bs = stmts.get("q_bs_extended") or stmts.get("q_bs")
+        q_bs_ext = stmts.get("q_bs_extended")
+        q_bs_raw = stmts.get("q_bs")
+        q_bs = q_bs_ext if (q_bs_ext is not None and not q_bs_ext.empty) else q_bs_raw
         bs_audit = stmts.get("bs_audit", {})
         if q_bs is not None and not q_bs.empty:
-            # Tag interpolated periods
-            for col in q_bs.columns:
-                is_interp = 1 if str(col)[:10] in bs_audit else 0
             load_balance(q_bs, symbol_nse, "quarterly", 0)
 
         # Quarterly cash flow (direct if available)
