@@ -2,7 +2,7 @@ import math
 import yfinance as yf
 from typing import Optional, Dict, Any, Tuple
 import pandas as pd
-
+from etl.extract.fundamentals_extract_patch import _apply_all_patches
 
 # ── Revenue sub-row patterns to skip ─────────────────────────
 _REVENUE_SUBROW_PATTERNS = [
@@ -308,5 +308,5 @@ def fetch_fundamentals(symbol: str) -> Dict[str, Any]:
                     out["TTM P/E"] = round(price / ttm_eps, 2)
     except:
         pass
-
+    _apply_all_patches(out, bs, cf, inc, info)
     return out
