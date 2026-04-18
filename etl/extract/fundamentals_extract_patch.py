@@ -1,22 +1,20 @@
 """
-fundamentals_extract_patch.py
-─────────────────────────────────────────────────────────────────
-This is a PATCH for your existing  etl/extract/fundamentals.py
-(i.e. the file that contains  fetch_fundamentals()).
-
-Paste the three blocks marked ── PASTE INTO fetch_fundamentals ──
-into the matching positions inside your existing function.
-They supply the new dict keys the v2 loader expects:
-
-    Total Debt, Cash        →  used to derive EV
-    Forward PE              →  stored as forward_pe
-    earnings_growth_json    →  JSON multi-year net income trend
-─────────────────────────────────────────────────────────────────
+etl/extract/fundamentals_extract_patch.py  v3.0
+────────────────────────────────────────────────────────────────
+Fixes vs v2:
+  • EV inputs already converted to Crores by fundamentals.py,
+    so patch just wires them together cleanly
+  • earnings_growth_json stores values in Rs. Crores
+  • All None-guards tightened so EV/EBITDA/EV/Revenue never NULL
+    when market cap + debt + cash are all present
+────────────────────────────────────────────────────────────────
 """
 
 import json
 import math
 from typing import Optional
+
+_CR = 1e7
 
 
 def _safe_float(v) -> Optional[float]:
@@ -27,64 +25,92 @@ def _safe_float(v) -> Optional[float]:
         return None
 
 
-# ── PASTE INTO fetch_fundamentals  (after existing BS rows) ──────
+def _cr(v) -> Optional[float]:
+    f = _safe_float(v)
+    return round(f / _CR, 2) if f is not None else None
+
+
+# ── EV inputs (Crores) ───────────────────────────────────────
+_DEBT_LABELS = {
+    "total debt", "long term debt", "long_term_debt",
+    "current debt", "short long term debt",
+}
+_CASH_LABELS = {
+    "cash and cash equivalents", "cash equivalents",
+    "cash cash equivalents and short term investments",
+    "cash and short term investments",
+}
+
+
+def _bs_first(bs, label_set: set) -> Optional[float]:
+    if bs is None or bs.empty:
+        return None
+    for idx in bs.index:
+        if str(idx).lower().strip() in label_set:
+            col = bs.loc[idx].dropna()
+            if not col.empty:
+                return _cr(col.iloc[0])
+    return None
+
+
 def _add_ev_inputs(out: dict, bs, info: dict) -> None:
     """
-    Add Total Debt and Cash to the output dict so the loader
-    can compute EV = Market Cap + Total Debt − Cash.
+    Ensure Total Debt, Cash, EV, EV/EBITDA, EV/Revenue are set.
+    All values in Rs. Crores.
+    fundamentals.py already computes these; this is a safety net.
     """
-    # Total Debt — try balance sheet first, then .info
-    total_debt = None
-    if bs is not None and not bs.empty:
-        for idx in bs.index:
-            if str(idx).lower().strip() == "total debt":
-                v = _safe_float(bs.loc[idx].dropna().iloc[0]
-                                if not bs.loc[idx].dropna().empty else None)
-                if v is not None:
-                    total_debt = v
-                    break
-    if total_debt is None:
-        total_debt = _safe_float(info.get("totalDebt"))
+    if out.get("Total Debt") is None:
+        v = _bs_first(bs, _DEBT_LABELS)
+        if v is None:
+            v = _cr(info.get("totalDebt"))
+        if v is not None:
+            out["Total Debt"] = v
 
-    # Cash — try balance sheet first, then .info
-    cash = None
-    if bs is not None and not bs.empty:
-        for idx in bs.index:
-            s = str(idx).lower().strip()
-            if s in ("cash and cash equivalents", "cash equivalents",
-                     "cash cash equivalents and short term investments"):
-                v = _safe_float(bs.loc[idx].dropna().iloc[0]
-                                if not bs.loc[idx].dropna().empty else None)
-                if v is not None:
-                    cash = v
-                    break
-    if cash is None:
-        cash = _safe_float(info.get("totalCash"))
+    if out.get("Cash") is None:
+        v = _bs_first(bs, _CASH_LABELS)
+        if v is None:
+            v = _cr(info.get("totalCash"))
+        if v is not None:
+            out["Cash"] = v
 
-    if total_debt is not None:
-        out["Total Debt"] = total_debt
-    if cash is not None:
-        out["Cash"] = cash
+    mc      = out.get("Market Cap")
+    debt    = out.get("Total Debt")
+    cash    = out.get("Cash")
+    ebitda  = out.get("EBITDA")
+    revenue = out.get("Revenue")
+
+    # Fallback: get from info if still missing
+    if mc is None:
+        mc = _cr(info.get("marketCap"))
+        if mc is not None:
+            out["Market Cap"] = mc
+
+    if mc is not None and debt is not None and cash is not None:
+        ev = round(mc + debt - cash, 2)
+        out["EV"] = ev
+        if ebitda and ebitda > 0:
+            out["EV/EBITDA"] = round(ev / ebitda, 2)
+        if revenue and revenue > 0:
+            out["EV/Revenue"] = round(ev / revenue, 2)
 
 
-# ── PASTE INTO fetch_fundamentals  (after P/E block) ─────────────
+# ── Forward PE ───────────────────────────────────────────────
 def _add_forward_pe(out: dict, info: dict) -> None:
-    """Add forward PE from yfinance .info."""
+    if out.get("Forward PE") is not None:
+        return
     fwd = _safe_float(info.get("forwardPE"))
-    if fwd is not None and 0 < fwd < 500:   # sanity-guard
+    if fwd is not None and 0 < fwd < 500:
         out["Forward PE"] = round(fwd, 2)
 
 
-# ── PASTE INTO fetch_fundamentals  (after TTM EPS block) ─────────
+# ── Earnings growth JSON (Rs. Crores) ────────────────────────
 def _add_earnings_growth_json(out: dict, inc) -> None:
     """
-    Build a JSON string of annual net-income values (newest → oldest)
-    so the loader can persist a multi-period earnings trend without
-    needing extra DB tables.
-
-    Example output:
-        '{"2024-03-31": 51234000000, "2023-03-31": 44321000000, ...}'
+    JSON of annual net-income in Rs. Crores, newest→oldest.
+    Example: {"2025-03-31": 11092.31, "2024-03-31": 8110.64}
     """
+    if out.get("earnings_growth_json") is not None:
+        return    # already set by fundamentals.py
     if inc is None or inc.empty:
         return
 
@@ -104,31 +130,17 @@ def _add_earnings_growth_json(out: dict, inc) -> None:
 
     trend = {}
     for col in inc.columns:
-        v = _safe_float(ni_row.get(col))
+        v = _cr(_safe_float(ni_row.get(col)))
         if v is not None:
-            trend[str(col)[:10]] = v   # "YYYY-MM-DD"
+            trend[str(col)[:10]] = v
 
     if trend:
         out["earnings_growth_json"] = json.dumps(trend)
-        out["earnings_growth"]      = trend          # raw dict for convenience
+        out["earnings_growth"]      = trend
 
 
-# ─────────────────────────────────────────────────────────────────
-#  Minimal integration example
-#  Replace the tail of your existing fetch_fundamentals() with:
-# ─────────────────────────────────────────────────────────────────
-
+# ── Master patch caller ───────────────────────────────────────
 def _apply_all_patches(out: dict, bs, cf, inc, info: dict) -> dict:
-    """
-    Call this once at the END of fetch_fundamentals(), passing the
-    same objects you already have in scope.
-
-    Example (inside fetch_fundamentals):
-
-        # ... existing code ...
-        _apply_all_patches(out, bs, cf, inc, info)
-        return out
-    """
     _add_ev_inputs(out, bs, info)
     _add_forward_pe(out, info)
     _add_earnings_growth_json(out, inc)

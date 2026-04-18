@@ -1,15 +1,38 @@
+"""
+etl/extract/quarterly_cashflow.py  v3.0
+────────────────────────────────────────────────────────────────
+Fixes vs v2:
+  • ALL figures stored in Rs. Crores (divide raw yfinance by 1e7)
+  • Direct quarterly CF from yfinance is now priority-1 and
+    returns real data — no fabrication
+  • Interpolated CapEx (Ann×ratio) is NEVER loaded by default;
+    only direct_qcf rows with is_interpolated=0 are produced here
+  • quarterly_cashflow_derived will no longer be empty — yfinance
+    quarterly_cash_flow is the primary source
+────────────────────────────────────────────────────────────────
+"""
+
 import math
 import pandas as pd
 import yfinance as yf
 from typing import Optional, Dict
+
+# ── Unit: all monetary values → Rs. Crores ───────────────────
+_CR = 1e7          # 1 Crore = 10,000,000
 
 
 def _safe_float(v) -> Optional[float]:
     try:
         fv = float(v)
         return None if math.isnan(fv) else fv
-    except:
+    except Exception:
         return None
+
+
+def _cr(v) -> Optional[float]:
+    """Convert raw rupees → Rs. Crores, rounded to 2dp."""
+    f = _safe_float(v)
+    return round(f / _CR, 2) if f is not None else None
 
 
 def _row(df, *cands):
@@ -27,179 +50,112 @@ def fetch_quarterly_cashflow(
     q_inc: pd.DataFrame = None,
     q_bs_extended: pd.DataFrame = None,
     bs_audit: dict = None,
+    q_bs_real: pd.DataFrame = None,
 ) -> list:
     """
-    Derive quarterly FCF (FIX-A) from Q-IS + interpolated Q-BS + annual CF.
-    Returns list of dicts ready for DB insertion.
+    Derive quarterly FCF — real data only, in Rs. Crores.
+
+    Priority:
+      1. Direct yfinance quarterly_cash_flow  [is_interpolated=0]
+      2. Net Income + D&A from quarterly IS   [is_interpolated=0, approx]
+      3. Nothing — we do NOT produce Ann×ratio fakes anymore
+
+    All monetary values are in Rs. Crores.
     """
-    t = yf.Ticker(symbol)
+    t       = yf.Ticker(symbol)
     records = []
 
-    # Try direct quarterly CF first
+    # ── Priority 1: direct quarterly CF ──────────────────────
     try:
         qcf = t.quarterly_cash_flow
         if qcf is not None and not qcf.empty:
-            ni_r   = _row(qcf, "Net Income From Continuing Operations",
-                          "Net Income Continuous Operations", "Net Income")
-            opcf_r = _row(qcf, "Operating Cash Flow",
-                          "Net Cash Provided By Operating Activities")
-            cx_r   = _row(qcf, "Capital Expenditure",
-                          "Purchase Of Property Plant And Equipment")
-            fcf_r  = _row(qcf, "Free Cash Flow")
-            rev_r  = _row(q_inc, "Total Revenue", "Revenue") if q_inc is not None else None
+            opcf_r  = _row(qcf, "Operating Cash Flow",
+                           "Net Cash Provided By Operating Activities")
+            cx_r    = _row(qcf, "Capital Expenditure",
+                           "Purchase Of Property Plant And Equipment")
+            fcf_r   = _row(qcf, "Free Cash Flow")
+            ni_r    = _row(qcf, "Net Income From Continuing Operations",
+                           "Net Income Continuous Operations", "Net Income")
+            dep_r   = _row(qcf, "Depreciation And Amortization", "Depreciation")
+            rev_r   = _row(q_inc, "Total Revenue", "Revenue") if q_inc is not None else None
 
             for col in qcf.columns:
-                op_cf = _safe_float(opcf_r.get(col)) if opcf_r is not None else None
-                capex = _safe_float(cx_r.get(col))   if cx_r   is not None else None
-                fcf   = _safe_float(fcf_r.get(col))  if fcf_r  is not None else None
-                rev   = _safe_float(rev_r.get(col))  if rev_r  is not None else None
-                ni    = _safe_float(ni_r.get(col))   if ni_r   is not None else None
+                op_cf = _cr(_safe_float(opcf_r.get(col)) if opcf_r is not None else None)
+                capex_raw = _safe_float(cx_r.get(col))   if cx_r   is not None else None
+                capex = _cr(abs(capex_raw))               if capex_raw is not None else None
+                fcf   = _cr(_safe_float(fcf_r.get(col))  if fcf_r  is not None else None)
+                rev   = _cr(_safe_float(rev_r.get(col))  if rev_r  is not None else None)
+                ni    = _cr(_safe_float(ni_r.get(col))   if ni_r   is not None else None)
+                da    = _cr(_safe_float(dep_r.get(col))  if dep_r  is not None else None)
 
                 if fcf is None and op_cf is not None and capex is not None:
-                    fcf = op_cf - abs(capex)
-                fcf_mgn = round(fcf / rev * 100, 2) if fcf and rev and rev != 0 else None
+                    fcf = round(op_cf - capex, 2)
+
+                fcf_mgn = (round(fcf / rev * 100, 2)
+                           if fcf is not None and rev and rev != 0 else None)
 
                 records.append({
                     "quarter_end":     str(col)[:10],
                     "revenue":         rev,
                     "net_income":      ni,
-                    "dna":             None,
+                    "dna":             da,
                     "approx_op_cf":    op_cf,
-                    "approx_capex":    abs(capex) if capex else None,
+                    "approx_capex":    capex,
                     "approx_fcf":      fcf,
                     "fcf_margin_pct":  fcf_mgn,
-                    "capex_source":    "direct",
+                    "capex_source":    "direct_qcf",
                     "is_interpolated": 0,
+                    "unit":            "Rs_Crores",
                 })
-            return records
-    except:
-        pass
 
-    # Derived from Q-IS + extended Q-BS
+            if records:
+                print(f"  ✅ quarterly_cashflow: {len(records)} direct QCF rows (Rs Cr)")
+                return records
+    except Exception as e:
+        print(f"  ⚠  quarterly_cashflow direct fetch failed: {e}")
+
+    # ── Priority 2: Net Income + D&A from quarterly IS ────────
+    # (still real data — no fabrication — just incomplete CF)
     if q_inc is None or q_inc.empty:
+        print("  ⚠  quarterly_cashflow: no q_inc available, returning empty")
         return records
 
-    if bs_audit is None:
-        bs_audit = {}
-
-    ann_cf = None
-    try:
-        ann_cf = t.cash_flow
-    except:
-        pass
-
-    ni_r     = _row(q_inc, "Net Income", "Net Income Common Stockholders",
-                    "Net Income From Continuing Operation Net Mino")
-    dep_r    = _row(q_inc, "Reconciled Depreciation",
-                    "Depreciation And Amortization In Income Stat", "Depreciation")
+    ni_r    = _row(q_inc, "Net Income", "Net Income Common Stockholders",
+                   "Net Income From Continuing Operation Net Mino")
+    dep_r   = _row(q_inc, "Reconciled Depreciation",
+                   "Depreciation And Amortization In Income Stat", "Depreciation")
     ebitda_r = _row(q_inc, "EBITDA", "Normalized EBITDA")
     ebit_r   = _row(q_inc, "EBIT", "Operating Income")
     rev_r    = _row(q_inc, "Total Revenue", "Operating Revenue", "Revenue")
-    ppe_r    = _row(q_bs_extended, "Net PPE", "Net Property Plant And Equipment") \
-               if q_bs_extended is not None and not q_bs_extended.empty else None
-
-    # Annual CapEx by FY
-    ann_capex_by_fy: Dict[int, float] = {}
-    if ann_cf is not None and not ann_cf.empty:
-        cx_row = _row(ann_cf, "Capital Expenditure",
-                      "Purchase Of Property Plant And Equipment",
-                      "Purchases Of Property Plant And Equipment")
-        if cx_row is not None:
-            for col in ann_cf.columns:
-                v = _safe_float(cx_row.get(col))
-                if v is not None:
-                    try:
-                        ct = pd.Timestamp(col)
-                        fy = ct.year if ct.month <= 3 else ct.year + 1
-                        ann_capex_by_fy[fy] = abs(v)
-                    except:
-                        pass
-
-    # Quarterly revenue by FY for prorating
-    qrev_by_fy: Dict[int, Dict] = {}
-    if rev_r is not None:
-        for col in q_inc.columns:
-            v = _safe_float(rev_r.get(col))
-            if v:
-                try:
-                    ct = pd.Timestamp(col)
-                    fy = ct.year if ct.month <= 3 else ct.year + 1
-                    qrev_by_fy.setdefault(fy, {})[col] = v
-                except:
-                    pass
-
-    q_bs_cols = list(q_bs_extended.columns) \
-        if q_bs_extended is not None and not q_bs_extended.empty else []
 
     for col in q_inc.columns:
-        def gv(row):
-            if row is None: return None
-            return _safe_float(row.get(col))
-
-        ni     = gv(ni_r)
-        dep    = gv(dep_r)
-        ebitda = gv(ebitda_r)
-        ebit   = gv(ebit_r)
-        rev    = gv(rev_r)
+        ni     = _cr(_safe_float(ni_r.get(col))     if ni_r    is not None else None)
+        dep    = _cr(_safe_float(dep_r.get(col))    if dep_r   is not None else None)
+        ebitda = _cr(_safe_float(ebitda_r.get(col)) if ebitda_r is not None else None)
+        ebit   = _cr(_safe_float(ebit_r.get(col))   if ebit_r  is not None else None)
+        rev    = _cr(_safe_float(rev_r.get(col))    if rev_r   is not None else None)
 
         da = dep if dep is not None else (
-            (ebitda - ebit) if ebitda is not None and ebit is not None else None
+            round(ebitda - ebit, 2)
+            if ebitda is not None and ebit is not None else None
         )
-        op_cf = (ni + da) if (ni is not None and da is not None) else ni
 
-        # CapEx derivation (FIX-A priority)
-        capex       = None
-        capex_src   = "N/A"
-        is_interp   = 0
-
-        if ppe_r is not None and col in q_bs_cols:
-            pos = q_bs_cols.index(col)
-            if pos + 1 < len(q_bs_cols):
-                prev_col = q_bs_cols[pos + 1]
-                try:
-                    ppe_curr = float(ppe_r[col])
-                    ppe_prev = float(ppe_r[prev_col])
-                    capex    = (ppe_curr - ppe_prev) + (da or 0)
-                    col_key  = str(col)[:10]
-                    is_interp = 1 if col_key in bs_audit else 0
-                    capex_src = f"ΔPPE+D&A{' [interp]' if is_interp else ''}"
-                except:
-                    pass
-
-        if capex is None and ann_capex_by_fy:
-            try:
-                ct = pd.Timestamp(col)
-                fy = ct.year if ct.month <= 3 else ct.year + 1
-                ann_cx = ann_capex_by_fy.get(fy) or list(ann_capex_by_fy.values())[0]
-                fy_revs = qrev_by_fy.get(fy, {})
-                total_fy_rev = sum(fy_revs.values())
-                if total_fy_rev > 0 and (rev or 0) > 0:
-                    share = (rev or 0) / total_fy_rev
-                    capex = ann_cx * share
-                    capex_src = f"Ann×{share:.2f}"
-                    is_interp = 1
-                else:
-                    capex = ann_cx / 4
-                    capex_src = "Ann÷4"
-                    is_interp = 1
-            except:
-                pass
-
-        fcf = (op_cf - abs(capex)
-               if op_cf is not None and capex is not None else op_cf)
-        fcf_mgn = round(fcf / rev * 100, 2) if fcf and rev and rev != 0 else None
+        op_cf = round(ni + da, 2) if ni is not None and da is not None else ni
 
         records.append({
-            "quarter_end":    str(col)[:10],
-            "revenue":        rev,
-            "net_income":     ni,
-            "dna":            da,
-            "approx_op_cf":   op_cf,
-            "approx_capex":   abs(capex) if capex is not None else None,
-            "approx_fcf":     fcf,
-            "fcf_margin_pct": fcf_mgn,
-            "capex_source":   capex_src,
-            "is_interpolated": is_interp,
+            "quarter_end":     str(col)[:10],
+            "revenue":         rev,
+            "net_income":      ni,
+            "dna":             da,
+            "approx_op_cf":    op_cf,
+            "approx_capex":    None,          # unknown — no fabrication
+            "approx_fcf":      op_cf,         # best proxy without capex
+            "fcf_margin_pct":  (round(op_cf / rev * 100, 2)
+                                if op_cf is not None and rev and rev != 0 else None),
+            "capex_source":    "NI+DA_approx",
+            "is_interpolated": 0,             # real IS data, not fabricated
+            "unit":            "Rs_Crores",
         })
 
+    print(f"  ✅ quarterly_cashflow: {len(records)} NI+DA rows (Rs Cr, no capex)")
     return records

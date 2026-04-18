@@ -1,3 +1,12 @@
+"""
+etl/extract/growth.py  v2.0
+────────────────────────────────────────────────────────────────
+Fixes vs v1:
+  • All monetary values in YoY JSON stored in Rs. Crores
+  • CAGR computed on Crore-scaled values (result unchanged — ratio)
+────────────────────────────────────────────────────────────────
+"""
+
 import math
 import json
 import yfinance as yf
@@ -5,13 +14,20 @@ import pandas as pd
 from typing import Optional, Dict
 from datetime import date
 
+_CR = 1e7   # 1 Crore
+
 
 def _safe_float(v) -> Optional[float]:
     try:
         fv = float(v)
         return None if math.isnan(fv) else fv
-    except:
+    except Exception:
         return None
+
+
+def _cr(v) -> Optional[float]:
+    f = _safe_float(v)
+    return round(f / _CR, 2) if f is not None else None
 
 
 def _cagr(end, start, years) -> Optional[float]:
@@ -21,11 +37,12 @@ def _cagr(end, start, years) -> Optional[float]:
         return None
     try:
         return ((end / start) ** (1 / years) - 1) * 100
-    except:
+    except Exception:
         return None
 
 
-def _yoy_series(df, *candidates) -> Dict[str, float]:
+def _yoy_series_cr(df, *candidates) -> Dict[str, float]:
+    """Extract a row as {date_str: crore_value} dict."""
     if df is None or df.empty:
         return {}
     for df_idx in df.index:
@@ -33,12 +50,17 @@ def _yoy_series(df, *candidates) -> Dict[str, float]:
             if c.lower() in str(df_idx).lower():
                 row = df.loc[df_idx].dropna()
                 if not row.empty:
-                    return {str(k)[:10]: float(v) for k, v in row.items()}
+                    result = {}
+                    for k, v in row.items():
+                        cv = _cr(v)
+                        if cv is not None:
+                            result[str(k)[:10]] = cv
+                    return result
     return {}
 
 
 def _yoy_growth_json(series: Dict[str, float]) -> str:
-    """Build [{year, value, yoy_pct}, ...] JSON array."""
+    """Build [{year, value_cr, yoy_pct}, ...] JSON array."""
     vals = list(series.values())
     keys = list(series.keys())
     records = []
@@ -46,12 +68,11 @@ def _yoy_growth_json(series: Dict[str, float]) -> str:
         yoy = None
         if i + 1 < len(vals) and vals[i + 1] and vals[i + 1] != 0:
             yoy = round((v / vals[i + 1] - 1) * 100, 2)
-        records.append({"year": k, "value": v, "yoy_pct": yoy})
+        records.append({"year": k, "value_cr": v, "yoy_pct": yoy})
     return json.dumps(records)
 
 
 def _compute_gross_margin_safe(inc, col_idx=0):
-    """Dual-method gross margin (simplified import-free version)."""
     if inc is None or inc.empty:
         return None
     rev = None
@@ -61,7 +82,7 @@ def _compute_gross_margin_safe(inc, col_idx=0):
                 v = float(inc.loc[idx].iloc[col_idx])
                 if not math.isnan(v) and v > 0:
                     rev = v; break
-            except:
+            except Exception:
                 pass
     if not rev:
         for idx in inc.index:
@@ -70,7 +91,7 @@ def _compute_gross_margin_safe(inc, col_idx=0):
                     v = float(inc.loc[idx].iloc[col_idx])
                     if not math.isnan(v) and v > 0:
                         rev = v; break
-                except:
+                except Exception:
                     pass
     if not rev:
         return None
@@ -82,7 +103,7 @@ def _compute_gross_margin_safe(inc, col_idx=0):
                     gm = gp / rev * 100
                     if 0 <= gm <= 100:
                         return round(gm, 2)
-            except:
+            except Exception:
                 pass
     for idx in inc.index:
         if "cost of revenue" in str(idx).lower() or "reconciled cost" in str(idx).lower():
@@ -92,32 +113,35 @@ def _compute_gross_margin_safe(inc, col_idx=0):
                     gm = (1 - cogs / rev) * 100
                     if 0 <= gm <= 100:
                         return round(gm, 2)
-            except:
+            except Exception:
                 pass
     return None
 
 
 def fetch_growth_metrics(symbol: str) -> dict:
-    """Compute growth CAGRs + YoY trends (mirrors test.py Section J)."""
+    """
+    Compute growth CAGRs + YoY trends.
+    All monetary values in Rs. Crores.
+    CAGR % values are unit-agnostic (ratios).
+    """
     t = yf.Ticker(symbol)
     try:
         inc  = t.income_stmt
         cf   = t.cash_flow
         info = t.info or {}
-    except:
+    except Exception:
         return {}
 
-    today  = date.today().isoformat()
-    shares = info.get("sharesOutstanding")
+    today = date.today().isoformat()
 
-    rev  = _yoy_series(inc, "Total Revenue", "Revenue")
-    ni   = _yoy_series(inc, "Net Income", "Net Income Common Stockholders")
-    eb   = _yoy_series(inc, "EBITDA", "Normalized EBITDA")
-    op_r = _yoy_series(cf, "Operating Cash Flow",
-                       "Net Cash Provided By Operating Activities")
-    cx_r = _yoy_series(cf, "Capital Expenditure",
-                       "Purchase Of Property Plant And Equipment",
-                       "Purchases Of Property Plant And Equipment")
+    rev  = _yoy_series_cr(inc, "Total Revenue", "Revenue")
+    ni   = _yoy_series_cr(inc, "Net Income", "Net Income Common Stockholders")
+    eb   = _yoy_series_cr(inc, "EBITDA", "Normalized EBITDA")
+    op_r = _yoy_series_cr(cf, "Operating Cash Flow",
+                          "Net Cash Provided By Operating Activities")
+    cx_r = _yoy_series_cr(cf, "Capital Expenditure",
+                          "Purchase Of Property Plant And Equipment",
+                          "Purchases Of Property Plant And Equipment")
 
     def series_cagr(s):
         vals = list(s.values())
@@ -130,9 +154,9 @@ def fetch_growth_metrics(symbol: str) -> dict:
     for yr in op_r:
         ocf = op_r[yr]
         cap = abs(cx_r.get(yr, 0)) if yr in cx_r else 0
-        fcf_series[yr] = ocf - cap
+        fcf_series[yr] = round(ocf - cap, 2)
 
-    # Gross margin trend
+    # Gross margin trend (% only — no unit conversion needed)
     gm_trend = []
     if inc is not None and not inc.empty:
         for i, col in enumerate(inc.columns):
@@ -140,17 +164,20 @@ def fetch_growth_metrics(symbol: str) -> dict:
             if gm is not None:
                 gm_trend.append({"year": str(col)[:10], "gross_margin_pct": gm})
 
+    def safe_round(v):
+        return round(v, 2) if v is not None else None
+
     return {
-        "as_of_date":               today,
-        "revenue_cagr_3y":          round(series_cagr(rev), 2) if series_cagr(rev) else None,
-        "net_profit_cagr_3y":       round(series_cagr(ni), 2)  if series_cagr(ni)  else None,
-        "ebitda_cagr_3y":           round(series_cagr(eb), 2)  if series_cagr(eb)  else None,
-        "eps_cagr_3y":              round(series_cagr(ni), 2)  if series_cagr(ni)  else None,
-        "fcf_cagr_3y":              round(series_cagr(fcf_series), 2)
-                                    if fcf_series and series_cagr(fcf_series) else None,
-        "revenue_yoy_json":         _yoy_growth_json(rev)        if rev        else None,
-        "net_income_yoy_json":      _yoy_growth_json(ni)         if ni         else None,
-        "ebitda_yoy_json":          _yoy_growth_json(eb)         if eb         else None,
-        "fcf_yoy_json":             _yoy_growth_json(fcf_series) if fcf_series else None,
-        "gross_margin_trend_json":  json.dumps(gm_trend)         if gm_trend   else None,
+        "as_of_date":              today,
+        "revenue_cagr_3y":         safe_round(series_cagr(rev)),
+        "net_profit_cagr_3y":      safe_round(series_cagr(ni)),
+        "ebitda_cagr_3y":          safe_round(series_cagr(eb)),
+        "eps_cagr_3y":             safe_round(series_cagr(ni)),
+        "fcf_cagr_3y":             safe_round(series_cagr(fcf_series)) if fcf_series else None,
+        "revenue_yoy_json":        _yoy_growth_json(rev)        if rev        else None,
+        "net_income_yoy_json":     _yoy_growth_json(ni)         if ni         else None,
+        "ebitda_yoy_json":         _yoy_growth_json(eb)         if eb         else None,
+        "fcf_yoy_json":            _yoy_growth_json(fcf_series) if fcf_series else None,
+        "gross_margin_trend_json": json.dumps(gm_trend)         if gm_trend   else None,
+        "unit":                    "Rs_Crores",
     }

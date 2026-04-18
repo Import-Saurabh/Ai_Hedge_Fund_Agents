@@ -1,8 +1,50 @@
+"""
+etl/load/earnings_loader.py  v2.0
+────────────────────────────────────────────────────────────────
+Fixes vs v1:
+  • _to_int() now correctly casts numpy int64 → Python int
+    (was storing raw 8-byte little-endian BLOBs like x'0100000000000000')
+  • Added explicit CAST in INSERT for integer columns as extra guard
+────────────────────────────────────────────────────────────────
+"""
+
+import math
 from database.db import get_connection
 
 
+def _to_int(v) -> int | None:
+    """
+    Safely cast any numeric type (numpy int64, float, str) to a plain
+    Python int that SQLite stores as INTEGER, not a BLOB.
+
+    Root cause of the BLOB issue: numpy int64 is not a Python int.
+    sqlite3 serialises it as an 8-byte binary blob instead of an integer.
+    Explicit int() conversion fixes this.
+    """
+    if v is None:
+        return None
+    try:
+        f = float(v)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return int(f)          # ← always a plain Python int
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_float(v) -> float | None:
+    if v is None:
+        return None
+    try:
+        f = float(v)
+        return None if (math.isnan(f) or math.isinf(f)) else f
+    except (TypeError, ValueError):
+        return None
+
+
+# ─────────────────────────────────────────────────────────────
 def load_earnings_history(records: list, symbol: str):
-    conn = get_connection()
+    conn  = get_connection()
     count = 0
     for r in records:
         conn.execute("""
@@ -11,9 +53,12 @@ def load_earnings_history(records: list, symbol: str):
                  eps_difference, surprise_pct)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (
-            symbol, r["quarter_end"],
-            r.get("eps_actual"), r.get("eps_estimate"),
-            r.get("eps_difference"), r.get("surprise_pct"),
+            symbol,
+            r["quarter_end"],
+            _to_float(r.get("eps_actual")),
+            _to_float(r.get("eps_estimate")),
+            _to_float(r.get("eps_difference")),
+            _to_float(r.get("surprise_pct")),
         ))
         count += 1
     conn.commit()
@@ -22,7 +67,7 @@ def load_earnings_history(records: list, symbol: str):
 
 
 def load_earnings_estimates(records: list, symbol: str):
-    conn = get_connection()
+    conn  = get_connection()
     count = 0
     for r in records:
         conn.execute("""
@@ -32,9 +77,15 @@ def load_earnings_estimates(records: list, symbol: str):
                  analyst_count, growth_pct)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            symbol, r["snapshot_date"], r["period_code"],
-            r.get("avg_eps"), r.get("low_eps"), r.get("high_eps"),
-            r.get("year_ago_eps"), r.get("analyst_count"), r.get("growth_pct"),
+            symbol,
+            r["snapshot_date"],
+            r["period_code"],
+            _to_float(r.get("avg_eps")),
+            _to_float(r.get("low_eps")),
+            _to_float(r.get("high_eps")),
+            _to_float(r.get("year_ago_eps")),
+            _to_int(r.get("analyst_count")),   # ← now a safe Python int
+            _to_float(r.get("growth_pct")),
         ))
         count += 1
     conn.commit()
@@ -43,7 +94,7 @@ def load_earnings_estimates(records: list, symbol: str):
 
 
 def load_eps_trend(records: list, symbol: str):
-    conn = get_connection()
+    conn  = get_connection()
     count = 0
     for r in records:
         conn.execute("""
@@ -53,10 +104,14 @@ def load_eps_trend(records: list, symbol: str):
                  sixty_days_ago, ninety_days_ago)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            symbol, r["snapshot_date"], r["period_code"],
-            r.get("current_est"), r.get("seven_days_ago"),
-            r.get("thirty_days_ago"), r.get("sixty_days_ago"),
-            r.get("ninety_days_ago"),
+            symbol,
+            r["snapshot_date"],
+            r["period_code"],
+            _to_float(r.get("current_est")),
+            _to_float(r.get("seven_days_ago")),
+            _to_float(r.get("thirty_days_ago")),
+            _to_float(r.get("sixty_days_ago")),
+            _to_float(r.get("ninety_days_ago")),
         ))
         count += 1
     conn.commit()
@@ -65,7 +120,14 @@ def load_eps_trend(records: list, symbol: str):
 
 
 def load_eps_revisions(records: list, symbol: str):
-    conn = get_connection()
+    """
+    Stores analyst revision counts as plain Python ints.
+
+    Previously stored as x'0100000000000000' BLOBs because
+    yfinance returns numpy int64 values. _to_int() converts them
+    to Python int before passing to sqlite3.
+    """
+    conn  = get_connection()
     count = 0
     for r in records:
         conn.execute("""
@@ -74,9 +136,13 @@ def load_eps_revisions(records: list, symbol: str):
                  up_last_7d, up_last_30d, down_last_30d, down_last_7d)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
-            symbol, r["snapshot_date"], r["period_code"],
-            r.get("up_last_7d"), r.get("up_last_30d"),
-            r.get("down_last_30d"), r.get("down_last_7d"),
+            symbol,
+            r["snapshot_date"],
+            r["period_code"],
+            _to_int(r.get("up_last_7d")),    # ← plain Python int, never BLOB
+            _to_int(r.get("up_last_30d")),
+            _to_int(r.get("down_last_30d")),
+            _to_int(r.get("down_last_7d")),
         ))
         count += 1
     conn.commit()

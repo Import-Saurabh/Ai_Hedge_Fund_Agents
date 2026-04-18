@@ -1,3 +1,16 @@
+"""
+etl/extract/macro.py  v2.0
+────────────────────────────────────────────────────────────────
+Fixes vs v1:
+  • Crude Oil / Gold change_pct was NULL because yfinance only
+    returns 1 row for futures in some periods — now uses period="5d"
+    to ensure at least 2 rows for pct_change
+  • RBI cached rates updated to reflect April 2025 cut (6.00%)
+  • fetch_macro_indicators now tags each record with is_cached flag
+    so the loader can skip re-inserting identical annual data
+────────────────────────────────────────────────────────────────
+"""
+
 import time
 import re
 import requests
@@ -35,27 +48,35 @@ FOREX_COMMODITIES = {"USD/INR", "Crude Oil WTI", "Gold Futures"}
 
 
 def fetch_market_indices() -> dict:
-    """Fetch all NSE index prices + forex/commodities."""
+    """Fetch all NSE index prices + forex/commodities with change_pct fix."""
     indices = {}
     forex   = {}
     today   = date.today().isoformat()
 
     for name, sym in NSE_INDICES.items():
         try:
-            hist = yf.Ticker(sym).history(period="2d", auto_adjust=True)
+            # Use 5d window to guarantee ≥2 rows for pct_change
+            hist = yf.Ticker(sym).history(period="5d", auto_adjust=True)
             if hist is not None and not hist.empty:
                 price = round(float(hist["Close"].iloc[-1]), 2)
                 chg   = None
                 if len(hist) >= 2:
-                    chg = round(float(hist["Close"].pct_change().iloc[-1]) * 100, 2)
+                    prev  = float(hist["Close"].iloc[-2])
+                    if prev and prev != 0:
+                        chg = round((price / prev - 1) * 100, 2)
                 direction = ("^" if chg and chg >= 0 else "v") if chg is not None else None
-                entry = {"date": today, "name": name, "price": price,
-                         "change_pct": chg, "direction": direction}
+                entry = {
+                    "date":       today,
+                    "name":       name,
+                    "price":      price,
+                    "change_pct": chg,
+                    "direction":  direction,
+                }
                 if name in FOREX_COMMODITIES:
                     forex[name] = entry
                 else:
                     indices[name] = entry
-        except Exception as e:
+        except Exception:
             pass
         time.sleep(0.25)
 
@@ -63,17 +84,23 @@ def fetch_market_indices() -> dict:
 
 
 def fetch_rbi_rates() -> dict:
-    """Fetch RBI rates with cached fallback."""
-    today = date.today().isoformat()
+    """
+    Fetch RBI rates.  Falls back to cached values if live scrape fails.
 
-    # Cached Apr 2025 rates (live sources may be unreachable)
+    Cached values reflect the April 2025 MPC decision:
+      Repo  6.00%  (cut from 6.25%)
+      SDF   5.75%
+      MSF   6.25%
+    """
+    today  = date.today().isoformat()
+
     cached = {
         "date":         today,
-        "repo_rate":    6.25,
+        "repo_rate":    6.00,    # April 2025 cut
         "reverse_repo": 3.35,
-        "sdf_rate":     6.00,
-        "msf_rate":     6.50,
-        "bank_rate":    6.50,
+        "sdf_rate":     5.75,
+        "msf_rate":     6.25,
+        "bank_rate":    6.25,
         "crr":          4.00,
         "slr":          18.00,
         "is_cached":    1,
@@ -95,7 +122,7 @@ def fetch_rbi_rates() -> dict:
                 "slr":          r"Statutory\s+Liquidity\s+Ratio[^\d]*([\d.]+)",
             }
             found = 0
-            live = {"date": today, "is_cached": 0, "source": "RBI website"}
+            live  = {"date": today, "is_cached": 0, "source": "RBI website"}
             for key, pat in patterns.items():
                 m = re.search(pat, html, re.IGNORECASE)
                 if m:
@@ -103,15 +130,21 @@ def fetch_rbi_rates() -> dict:
                     found += 1
             if found >= 3:
                 return live
-    except:
+    except Exception:
         pass
 
     return cached
 
 
 def fetch_macro_indicators() -> list:
-    """Fetch World Bank macro indicators for India."""
-    today = date.today().isoformat()
+    """
+    Fetch World Bank macro indicators for India.
+
+    Each record gets an `is_cached` flag (0=live, 1=fallback) and
+    a `data_year` field so the loader can avoid re-inserting the
+    same annual value on every pipeline run.
+    """
+    today  = date.today().isoformat()
     WB = {
         "India CPI Inflation (%)": "FP.CPI.TOTL.ZG",
         "India GDP Growth (%)":    "NY.GDP.MKTP.KD.ZG",
@@ -136,8 +169,9 @@ def fetch_macro_indicators() -> list:
                                 "source":         "World Bank",
                                 "value":          float(val),
                                 "year":           int(yr),
+                                "is_cached":      0,
                             })
                             break
-        except:
+        except Exception:
             pass
     return results
