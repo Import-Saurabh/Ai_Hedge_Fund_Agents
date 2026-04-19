@@ -1,24 +1,22 @@
 """
-etl/load/balance_loader.py  v3.0
+etl/load/balance_loader.py  v4.0
 ────────────────────────────────────────────────────────────────
-Fixes vs v2:
-  • All monetary values converted from raw rupees → Rs. Crores
-    before insert (÷ 1e7), rounded to 2 decimal places
-  • Dedup guard: skip insert if identical row already exists for
-    (symbol, period_end, period_type) — prevents accumulation
-  • Quarterly BS period_end normalised to YYYY-MM-DD string
+Changes vs v3:
+  • load_balance_from_screener() writes scr_* columns into the
+    same balance_sheet table, using INSERT ... ON CONFLICT merge
+  • data_source tracks 'yfinance' | 'screener' | 'both'
 ────────────────────────────────────────────────────────────────
 """
 
+import re
 import math
 import pandas as pd
 from database.db import get_connection
 
-_CR = 1e7   # 1 Crore = 10,000,000
+_CR = 1e7
 
 
 def _cr(v) -> float | None:
-    """Raw rupees → Rs. Crores, 2 dp. Returns None for NaN/None/0-ish."""
     if v is None:
         return None
     try:
@@ -31,7 +29,6 @@ def _cr(v) -> float | None:
 
 
 def _row_val(df, *candidates) -> float | None:
-    """Extract the first non-NaN value from matching index rows."""
     if df is None or df.empty:
         return None
     for name in candidates:
@@ -49,22 +46,11 @@ def _row_val(df, *candidates) -> float | None:
     return None
 
 
-def _already_exists(conn, symbol: str, period_end: str, period_type: str) -> bool:
-    cur = conn.execute(
-        "SELECT 1 FROM balance_sheet WHERE symbol=? AND period_end=? AND period_type=?",
-        (symbol, period_end, period_type)
-    )
-    return cur.fetchone() is not None
-
-
 def load_balance(df: pd.DataFrame, symbol: str, period_type: str,
                  is_interpolated: int = 0):
-    """
-    Load balance sheet rows.  All monetary values stored in Rs. Crores.
-    Skips rows that already exist (upsert by UNIQUE constraint).
-    """
+    """Load yfinance balance sheet rows (detailed line items)."""
     if df is None or df.empty:
-        print(f"  ⚠  balance_sheet ({period_type}): empty dataframe — skipping")
+        print(f"  ⚠  balance_sheet ({period_type}): empty — skipping")
         return
 
     conn  = get_connection()
@@ -75,7 +61,6 @@ def load_balance(df: pd.DataFrame, symbol: str, period_type: str,
         col_df = df[[col]]
 
         def get(label, *more):
-            row = col_df.rename(columns={col: "v"})
             for cand in (label,) + more:
                 for idx in col_df.index:
                     if str(idx).lower().strip() == cand.lower().strip():
@@ -93,7 +78,7 @@ def load_balance(df: pd.DataFrame, symbol: str, period_type: str,
             return None
 
         conn.execute("""
-            INSERT OR REPLACE INTO balance_sheet (
+            INSERT INTO balance_sheet (
                 symbol, period_end, period_type,
                 total_assets, current_assets,
                 cash_and_equivalents, cash_equivalents,
@@ -119,11 +104,21 @@ def load_balance(df: pd.DataFrame, symbol: str, period_type: str,
                 other_equity_interest, minority_interest,
                 total_debt, net_debt, working_capital, invested_capital,
                 tangible_book_value, capital_lease_obligations,
-                shares_issued, is_interpolated
+                shares_issued, is_interpolated, data_source
             ) VALUES (
                 ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
             )
+            ON CONFLICT(symbol, period_end, period_type) DO UPDATE SET
+                total_assets=excluded.total_assets,
+                current_assets=excluded.current_assets,
+                cash_and_equivalents=excluded.cash_and_equivalents,
+                total_liabilities=excluded.total_liabilities,
+                total_equity=excluded.total_equity,
+                total_debt=excluded.total_debt,
+                net_debt=excluded.net_debt,
+                data_source=CASE WHEN data_source='screener' THEN 'both'
+                                 ELSE 'yfinance' END
         """, (
             symbol, period_end, period_type,
             get("Total Assets"),
@@ -182,9 +177,119 @@ def load_balance(df: pd.DataFrame, symbol: str, period_type: str,
             get("Capital Lease Obligations"),
             get("Ordinary Shares Number", "Share Issued"),
             is_interpolated,
+            "yfinance",
         ))
         count += 1
 
     conn.commit()
     conn.close()
-    print(f"  ✅ balance_sheet ({period_type}): {count} rows upserted (Rs Cr)")
+    print(f"  ✅ balance_sheet ({period_type}): {count} rows upserted [yfinance]")
+
+
+MONTH_MAP = {"jan":"01","feb":"02","mar":"03","apr":"04","may":"05","jun":"06",
+             "jul":"07","aug":"08","sep":"09","oct":"10","nov":"11","dec":"12"}
+MONTH_END = {"01":"31","02":"28","03":"31","04":"30","05":"31","06":"30",
+             "07":"31","08":"31","09":"30","10":"31","11":"30","12":"31"}
+
+
+def _parse_period(label: str):
+    label = str(label).strip()
+    if label.upper() in ("TTM", "NAN", ""):
+        return None
+    m = re.match(r"([A-Za-z]{3})\s+(\d{4})", label)
+    if not m:
+        return None
+    mon = MONTH_MAP.get(m.group(1).lower())
+    if not mon:
+        return None
+    return f"{m.group(2)}-{mon}-{MONTH_END[mon]}"
+
+
+def load_balance_from_screener(df: pd.DataFrame, symbol: str):
+    """
+    Load Screener balance sheet into scr_* columns.
+    Screener BS has both annual (Mar YYYY) and half-year (Sep YYYY) periods.
+    Values already in Rs. Crores — no conversion.
+    Half-year periods stored as period_type='half_year'.
+    """
+    if df is None or df.empty:
+        print("  ⚠  balance_sheet screener: empty — skipping")
+        return
+
+    def row(metric):
+        for idx in df.index:
+            if metric.lower() in str(idx).lower():
+                return df.loc[idx]
+        return None
+
+    eq_r     = row("Equity Capital")
+    res_r    = row("Reserves")
+    bor_r    = row("Borrowings")
+    othl_r   = row("Other Liabilities")
+    totl_r   = row("Total Liabilities")
+    fix_r    = row("Fixed Assets")
+    cwip_r   = row("CWIP")
+    inv_r    = row("Investments")
+    otha_r   = row("Other Assets")
+    tota_r   = row("Total Assets")
+
+    def v(series, col):
+        if series is None:
+            return None
+        raw = series.get(col)
+        if raw is None:
+            return None
+        s = str(raw).replace(",", "").strip()
+        if s in ("", "-", "—", "N/A", "nan", "None"):
+            return None
+        try:
+            return round(float(s), 2)
+        except ValueError:
+            return None
+
+    conn  = get_connection()
+    count = 0
+
+    for col in df.columns:
+        period_end = _parse_period(str(col))
+        if not period_end:
+            continue
+        # Determine period_type: Mar = annual, others = half_year
+        col_str = str(col).strip()
+        period_type = "annual" if col_str.startswith("Mar") else "half_year"
+
+        conn.execute("""
+            INSERT INTO balance_sheet (
+                symbol, period_end, period_type,
+                scr_equity_capital, scr_reserves, scr_borrowings,
+                scr_other_liabilities, scr_total_liabilities,
+                scr_fixed_assets, scr_cwip, scr_investments,
+                scr_other_assets, scr_total_assets,
+                data_source
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(symbol, period_end, period_type) DO UPDATE SET
+                scr_equity_capital=excluded.scr_equity_capital,
+                scr_reserves=excluded.scr_reserves,
+                scr_borrowings=excluded.scr_borrowings,
+                scr_other_liabilities=excluded.scr_other_liabilities,
+                scr_total_liabilities=excluded.scr_total_liabilities,
+                scr_fixed_assets=excluded.scr_fixed_assets,
+                scr_cwip=excluded.scr_cwip,
+                scr_investments=excluded.scr_investments,
+                scr_other_assets=excluded.scr_other_assets,
+                scr_total_assets=excluded.scr_total_assets,
+                data_source=CASE WHEN data_source='yfinance' THEN 'both'
+                                 ELSE 'screener' END
+        """, (
+            symbol, period_end, period_type,
+            v(eq_r,   col), v(res_r,  col), v(bor_r, col),
+            v(othl_r, col), v(totl_r, col),
+            v(fix_r,  col), v(cwip_r, col), v(inv_r, col),
+            v(otha_r, col), v(tota_r, col),
+            "screener",
+        ))
+        count += 1
+
+    conn.commit()
+    conn.close()
+    print(f"  ✅ balance_sheet: {count} Screener rows upserted [screener]")

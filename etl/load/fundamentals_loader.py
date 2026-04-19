@@ -134,3 +134,90 @@ def load_fundamentals(symbol: str, data: dict):
     conn.commit()
     conn.close()
     print(f"  ✅ fundamentals: saved for {symbol} on {today}")
+
+def load_fundamentals_from_screener(ratios_df, symbol: str):
+    """
+    Merge Screener Ratios sheet into fundamentals table.
+    Screener Ratios columns: Debtor Days, Inventory Days, Days Payable,
+    Cash Conversion Cycle, Working Capital Days, ROCE %.
+    Uses most recent period column (last col in DataFrame).
+    Updates today's fundamentals row if it exists, else inserts minimal row.
+    """
+    if ratios_df is None or ratios_df.empty:
+        print("  warning  fundamentals screener ratios: no data")
+        return
+
+    today = date.today().isoformat()
+
+    def row(metric):
+        for idx in ratios_df.index:
+            if metric.lower() in str(idx).lower():
+                return ratios_df.loc[idx]
+        return None
+
+    def v(series, col):
+        if series is None:
+            return None
+        raw = series.get(col)
+        if raw is None:
+            return None
+        s = str(raw).replace("%", "").replace(",", "").strip()
+        if s in ("", "-", "nan", "None"):
+            return None
+        try:
+            return round(float(s), 4)
+        except ValueError:
+            return None
+
+    # Use the most recent column (last)
+    col = ratios_df.columns[-1]
+
+    debtor_r  = row("Debtor Days")
+    inv_r     = row("Inventory Days")
+    pay_r     = row("Days Payable")
+    ccc_r     = row("Cash Conversion Cycle")
+    wcd_r     = row("Working Capital Days")
+    roce_r    = row("ROCE %")
+
+    dso  = v(debtor_r, col)
+    dio  = v(inv_r, col)
+    dpo  = v(pay_r, col)
+    ccc  = v(ccc_r, col)
+    wcd  = v(wcd_r, col)
+    roce = v(roce_r, col)
+
+    conn = get_connection()
+
+    # Try to update today's existing row first
+    cur = conn.execute(
+        "SELECT id FROM fundamentals WHERE symbol=? AND as_of_date=?",
+        (symbol, today)
+    )
+    existing = cur.fetchone()
+
+    if existing:
+        conn.execute("""
+            UPDATE fundamentals SET
+                dso_days = COALESCE(?, dso_days),
+                dio_days = COALESCE(?, dio_days),
+                dpo_days = COALESCE(?, dpo_days),
+                cash_conversion_cycle = COALESCE(?, cash_conversion_cycle),
+                working_capital_days  = COALESCE(?, working_capital_days),
+                roce_pct = COALESCE(?, roce_pct),
+                opm_pct  = COALESCE(opm_pct, NULL),
+                data_source = 'both'
+            WHERE symbol=? AND as_of_date=?
+        """, (dso, dio, dpo, ccc, wcd, roce, symbol, today))
+    else:
+        conn.execute("""
+            INSERT OR IGNORE INTO fundamentals (
+                symbol, as_of_date,
+                dso_days, dio_days, dpo_days,
+                cash_conversion_cycle, working_capital_days,
+                roce_pct, data_source
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+        """, (symbol, today, dso, dio, dpo, ccc, wcd, roce, "screener"))
+
+    conn.commit()
+    conn.close()
+    print(f"  ok  fundamentals: Screener ratios merged for {symbol}")

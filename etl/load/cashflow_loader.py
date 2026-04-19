@@ -1,13 +1,14 @@
 """
-etl/load/cashflow_loader.py  v2.0
+etl/load/cashflow_loader.py  v3.0
 ────────────────────────────────────────────────────────────────
-Fixes vs v1:
-  • All monetary columns converted raw rupees → Rs. Crores (÷ 1e7)
-    before insert, rounded to 2 dp
-  • Uses INSERT OR REPLACE for safe upsert
+Changes vs v2:
+  • load_cashflow_from_screener() writes scr_* columns into the
+    same cash_flow table using INSERT ... ON CONFLICT merge
+  • data_source column tracks 'yfinance' | 'screener' | 'both'
 ────────────────────────────────────────────────────────────────
 """
 
+import re
 import math
 import pandas as pd
 from database.db import get_connection
@@ -46,7 +47,7 @@ def _col_val(s, *candidates):
 
 
 def load_cashflow(df: pd.DataFrame, symbol: str, period_type: str):
-    """Load cash flow rows. All monetary values stored in Rs. Crores."""
+    """Load yfinance cash flow rows (detailed line items)."""
     if df is None or df.empty:
         print(f"  ⚠  cash_flow ({period_type}): empty — skipping")
         return
@@ -62,7 +63,7 @@ def load_cashflow(df: pd.DataFrame, symbol: str, period_type: str):
             return _cr(_col_val(s, *names))
 
         conn.execute("""
-            INSERT OR REPLACE INTO cash_flow (
+            INSERT INTO cash_flow (
                 symbol, period_end, period_type,
                 operating_cash_flow, net_income_ops, depreciation,
                 change_in_working_capital, change_in_receivables,
@@ -78,10 +79,17 @@ def load_cashflow(df: pd.DataFrame, symbol: str, period_type: str):
                 short_term_debt_net, dividends_paid, interest_paid,
                 stock_issuance, other_financing,
                 free_cash_flow, beginning_cash, end_cash,
-                changes_in_cash, is_interpolated
+                changes_in_cash, is_interpolated, data_source
             ) VALUES (
-                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
             )
+            ON CONFLICT(symbol, period_end, period_type) DO UPDATE SET
+                operating_cash_flow=excluded.operating_cash_flow,
+                investing_cash_flow=excluded.investing_cash_flow,
+                financing_cash_flow=excluded.financing_cash_flow,
+                free_cash_flow=excluded.free_cash_flow,
+                data_source=CASE WHEN data_source='screener' THEN 'both'
+                                 ELSE 'yfinance' END
         """, (
             symbol, period_end, period_type,
             gcr("Operating Cash Flow", "Net Cash Provided By Operating Activities"),
@@ -120,9 +128,104 @@ def load_cashflow(df: pd.DataFrame, symbol: str, period_type: str):
             gcr("End Cash Position"),
             gcr("Changes In Cash"),
             0,
+            "yfinance",
         ))
         count += 1
 
     conn.commit()
     conn.close()
-    print(f"  ✅ cash_flow ({period_type}): {count} rows upserted (Rs Cr)")
+    print(f"  ✅ cash_flow ({period_type}): {count} rows upserted [yfinance]")
+
+
+MONTH_MAP = {"jan":"01","feb":"02","mar":"03","apr":"04","may":"05","jun":"06",
+             "jul":"07","aug":"08","sep":"09","oct":"10","nov":"11","dec":"12"}
+MONTH_END = {"01":"31","02":"28","03":"31","04":"30","05":"31","06":"30",
+             "07":"31","08":"31","09":"30","10":"31","11":"30","12":"31"}
+
+
+def _parse_period(label: str):
+    label = str(label).strip()
+    if label.upper() in ("TTM", "NAN", ""):
+        return None
+    m = re.match(r"([A-Za-z]{3})\s+(\d{4})", label)
+    if not m:
+        return None
+    mon = MONTH_MAP.get(m.group(1).lower())
+    if not mon:
+        return None
+    return f"{m.group(2)}-{mon}-{MONTH_END[mon]}"
+
+
+def load_cashflow_from_screener(df: pd.DataFrame, symbol: str):
+    """
+    Load Screener cash flow into scr_* columns of cash_flow table.
+    Values already in Rs. Crores — no conversion needed.
+    All Screener CF data is annual (Mar YYYY periods).
+    """
+    if df is None or df.empty:
+        print("  ⚠  cash_flow screener: empty — skipping")
+        return
+
+    def row(metric):
+        for idx in df.index:
+            if metric.lower() in str(idx).lower():
+                return df.loc[idx]
+        return None
+
+    ocf_r  = row("Cash from Operating Activity")
+    icf_r  = row("Cash from Investing Activity")
+    fcf_r  = row("Cash from Financing Activity")
+    ncf_r  = row("Net Cash Flow")
+    fcf2_r = row("Free Cash Flow")
+    cfo_r  = row("CFO/OP")
+
+    def v(series, col):
+        if series is None:
+            return None
+        raw = series.get(col)
+        if raw is None:
+            return None
+        s = str(raw).replace("%", "").replace(",", "").strip()
+        if s in ("", "-", "—", "N/A", "nan", "None"):
+            return None
+        try:
+            return round(float(s), 4)
+        except ValueError:
+            return None
+
+    conn  = get_connection()
+    count = 0
+
+    for col in df.columns:
+        period_end = _parse_period(str(col))
+        if not period_end:
+            continue
+
+        conn.execute("""
+            INSERT INTO cash_flow (
+                symbol, period_end, period_type,
+                scr_cash_from_operating, scr_cash_from_investing,
+                scr_cash_from_financing, scr_net_cash_flow,
+                scr_free_cash_flow, scr_cfo_op_pct,
+                data_source
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(symbol, period_end, period_type) DO UPDATE SET
+                scr_cash_from_operating=excluded.scr_cash_from_operating,
+                scr_cash_from_investing=excluded.scr_cash_from_investing,
+                scr_cash_from_financing=excluded.scr_cash_from_financing,
+                scr_net_cash_flow=excluded.scr_net_cash_flow,
+                scr_free_cash_flow=excluded.scr_free_cash_flow,
+                scr_cfo_op_pct=excluded.scr_cfo_op_pct,
+                data_source=CASE WHEN data_source='yfinance' THEN 'both'
+                                 ELSE 'screener' END
+        """, (
+            symbol, period_end, "annual",
+            v(ocf_r, col), v(icf_r, col), v(fcf_r, col),
+            v(ncf_r, col), v(fcf2_r, col), v(cfo_r, col),
+            "screener",
+        ))
+        count += 1
+
+    conn.commit()
+    conn.close()
+    print(f"  ✅ cash_flow: {count} Screener rows upserted [screener]")
