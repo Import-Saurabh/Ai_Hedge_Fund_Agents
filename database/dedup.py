@@ -1,61 +1,44 @@
 """
-database/dedup.py
+database/dedup.py  v2.0
 ─────────────────────────────────────────────────────────────────
-Removes duplicate snapshot rows that accumulate when the pipeline
-runs multiple days in a row but the underlying source data hasn't
-changed (e.g. growth_metrics, ownership, rbi_rates, macro_indicators,
-fundamentals).
-
-Strategy: for each logical "entity + data fingerprint" keep only
-the EARLIEST row (lowest rowid). Later runs with identical values
-are deleted. Rows where the data genuinely changed are kept.
-
-Call run_all_dedup() once at the end of every pipeline run.
+Fixes vs v1:
+  • growth_metrics: dedup now compares as_of_date + cagr values
+    (not just symbol) so re-runs on same day with same data skip
+  • fundamentals: dedup keyed on (symbol, as_of_date) + roe/eps
+  • market_indices / forex_commodities: already have UNIQUE on
+    (snapshot_date, name) — dedup config updated to match
+  • Added quarterly_cashflow_derived to dedup config
 ─────────────────────────────────────────────────────────────────
 """
 
 from database.db import get_connection
 
 
-# ── Per-table dedup config ────────────────────────────────────
-# key_cols    : columns that define "same entity"
-# data_cols   : columns that define "same data content"
-#               (if ALL are equal across rows for the same key → duplicate)
-# keep        : "first" keeps oldest (MIN rowid), "last" keeps newest
 _DEDUP_CONFIG = [
     {
         "table":     "growth_metrics",
-        "key_cols":  ["symbol"],
-        "data_cols": [
-            "revenue_cagr_3y", "net_profit_cagr_3y", "ebitda_cagr_3y",
-            "eps_cagr_3y", "fcf_cagr_3y",
-            "revenue_yoy_json", "net_income_yoy_json",
-        ],
+        "key_cols":  ["symbol", "as_of_date"],
+        "data_cols": ["revenue_cagr_3y", "net_profit_cagr_3y",
+                      "ebitda_cagr_3y", "fcf_cagr_3y"],
         "keep": "first",
     },
     {
         "table":     "ownership",
         "key_cols":  ["symbol"],
-        "data_cols": [
-            "promoter_pct", "fii_fpi_pct", "dii_pct", "public_retail_pct",
-            "total_institutional_pct",
-        ],
+        "data_cols": ["promoter_pct", "fii_fpi_pct", "dii_pct",
+                      "public_retail_pct", "total_institutional_pct"],
         "keep": "first",
     },
     {
         "table":     "fundamentals",
-        "key_cols":  ["symbol"],
-        "data_cols": [
-            "roe_pct", "roce_pct", "roa_pct",
-            "free_cash_flow", "operating_cf", "capex",
-            "gross_margin_pct", "net_profit_margin_pct",
-            "eps_annual", "pe_ratio",
-        ],
+        "key_cols":  ["symbol", "as_of_date"],
+        "data_cols": ["roe_pct", "roce_pct", "roa_pct",
+                      "eps_annual", "pe_ratio"],
         "keep": "first",
     },
     {
         "table":     "rbi_rates",
-        "key_cols":  [],          # no symbol — only one RBI
+        "key_cols":  ["effective_date"],
         "data_cols": ["repo_rate", "reverse_repo", "crr", "slr"],
         "keep": "first",
     },
@@ -95,17 +78,23 @@ _DEDUP_CONFIG = [
         "data_cols": ["up_last_7d", "down_last_7d"],
         "keep": "first",
     },
+    {
+        "table":     "quarterly_cashflow_derived",
+        "key_cols":  ["symbol", "quarter_end"],
+        "data_cols": ["approx_fcf", "net_income"],
+        "keep": "first",
+    },
+    {
+        "table":     "technical_indicators",
+        "key_cols":  ["symbol", "date"],
+        "data_cols": ["close", "rsi_14"],
+        "keep": "first",
+    },
 ]
 
 
-def _dedup_table(conn, table: str, key_cols: list, data_cols: list, keep: str = "first"):
-    """
-    Delete duplicate rows from `table`.
-
-    Two rows are duplicates when all key_cols AND all data_cols match.
-    We keep either the MIN(rowid) [keep='first'] or MAX(rowid) [keep='last'].
-    """
-    # Check table exists
+def _dedup_table(conn, table: str, key_cols: list,
+                 data_cols: list, keep: str = "first") -> int:
     exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
     ).fetchone()
@@ -116,7 +105,14 @@ def _dedup_table(conn, table: str, key_cols: list, data_cols: list, keep: str = 
     if not group_cols:
         return 0
 
-    group_expr = ", ".join(group_cols)
+    # Only include columns that actually exist in the table
+    pragma     = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    table_cols = {r[1] for r in pragma}
+    valid_cols = [c for c in group_cols if c in table_cols]
+    if not valid_cols:
+        return 0
+
+    group_expr = ", ".join(valid_cols)
     agg        = "MIN(rowid)" if keep == "first" else "MAX(rowid)"
 
     sql = f"""
@@ -132,7 +128,7 @@ def _dedup_table(conn, table: str, key_cols: list, data_cols: list, keep: str = 
 
 
 def run_all_dedup():
-    """Run deduplication across all configured tables. Returns summary dict."""
+    """Run deduplication across all configured tables."""
     conn    = get_connection()
     summary = {}
 
@@ -157,13 +153,6 @@ def run_all_dedup():
 
 
 def run_one_time_cleanup():
-    """
-    Run once against an already-corrupted database to purge all
-    accumulated duplicate snapshot rows.
-
-    Usage:
-        python -c "from database.dedup import run_one_time_cleanup; run_one_time_cleanup()"
-    """
     print("═" * 60)
     print("ONE-TIME DEDUP CLEANUP")
     print("═" * 60)

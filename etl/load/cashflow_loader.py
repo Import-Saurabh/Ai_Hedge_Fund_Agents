@@ -1,37 +1,66 @@
+"""
+etl/load/cashflow_loader.py  v2.0
+────────────────────────────────────────────────────────────────
+Fixes vs v1:
+  • All monetary columns converted raw rupees → Rs. Crores (÷ 1e7)
+    before insert, rounded to 2 dp
+  • Uses INSERT OR REPLACE for safe upsert
+────────────────────────────────────────────────────────────────
+"""
+
 import math
 import pandas as pd
 from database.db import get_connection
 
+_CR = 1e7
 
-def _g(df, row_name, col):
-    for idx in df.index:
-        if str(idx).lower().strip() == row_name.lower():
-            try:
-                v = float(df.loc[idx, col])
-                return None if math.isnan(v) else v
-            except:
-                return None
-    for idx in df.index:
-        if row_name.lower() in str(idx).lower():
-            try:
-                v = float(df.loc[idx, col])
-                return None if math.isnan(v) else v
-            except:
-                return None
+
+def _cr(v) -> float | None:
+    if v is None:
+        return None
+    try:
+        fv = float(v)
+        if math.isnan(fv) or math.isinf(fv):
+            return None
+        return round(fv / _CR, 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _col_val(s, *candidates):
+    for cand in candidates:
+        for idx in s.index:
+            if str(idx).lower().strip() == cand.lower().strip():
+                try:
+                    return float(s[idx])
+                except Exception:
+                    pass
+    for cand in candidates:
+        for idx in s.index:
+            if cand.lower() in str(idx).lower():
+                try:
+                    return float(s[idx])
+                except Exception:
+                    pass
     return None
 
 
-def load_cashflow(df: pd.DataFrame, symbol: str, period_type: str = "annual"):
-    """Load full cash flow statement."""
+def load_cashflow(df: pd.DataFrame, symbol: str, period_type: str):
+    """Load cash flow rows. All monetary values stored in Rs. Crores."""
     if df is None or df.empty:
-        print(f"  ⚠  cash_flow ({period_type}): empty, skipping")
+        print(f"  ⚠  cash_flow ({period_type}): empty — skipping")
         return
 
-    conn = get_connection()
+    conn  = get_connection()
     count = 0
 
     for col in df.columns:
-        date_str = str(col)[:10]
+        period_end = str(col)[:10]
+        s = df[col]
+
+        def gcr(*names):
+            return _cr(_col_val(s, *names))
+
         conn.execute("""
             INSERT OR REPLACE INTO cash_flow (
                 symbol, period_end, period_type,
@@ -48,64 +77,52 @@ def load_cashflow(df: pd.DataFrame, symbol: str, period_type: str = "annual"):
                 long_term_debt_issuance, long_term_debt_payments,
                 short_term_debt_net, dividends_paid, interest_paid,
                 stock_issuance, other_financing,
-                free_cash_flow, beginning_cash, end_cash, changes_in_cash
+                free_cash_flow, beginning_cash, end_cash,
+                changes_in_cash, is_interpolated
             ) VALUES (
-                ?, ?, ?,
-                ?, ?, ?,
-                ?, ?,
-                ?, ?,
-                ?, ?,
-                ?, ?,
-                ?, ?, ?, ?,
-                ?, ?,
-                ?, ?,
-                ?, ?, ?,
-                ?, ?,
-                ?, ?,
-                ?, ?, ?,
-                ?, ?,
-                ?, ?, ?, ?
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
             )
         """, (
-            symbol, date_str, period_type,
-            _g(df, "Operating Cash Flow", col),
-            _g(df, "Net Income From Continuing Operations", col),
-            _g(df, "Depreciation", col) or _g(df, "Depreciation And Amortization", col),
-            _g(df, "Change In Working Capital", col),
-            _g(df, "Change In Receivables", col),
-            _g(df, "Change In Inventory", col),
-            _g(df, "Change In Payable", col),
-            _g(df, "Change In Other Current Assets", col),
-            _g(df, "Change In Other Current Liabilities", col),
-            _g(df, "Other Non Cash Items", col),
-            _g(df, "Taxes Refund Paid", col),
-            _g(df, "Investing Cash Flow", col),
-            _g(df, "Capital Expenditure", col),
-            _g(df, "Purchase Of PPE", col) or _g(df, "Purchase Of Property Plant And Equipment", col),
-            _g(df, "Sale Of PPE", col) or _g(df, "Sale Of Property Plant And Equipment", col),
-            _g(df, "Purchase Of Business", col),
-            _g(df, "Sale Of Business", col),
-            _g(df, "Purchase Of Investment", col),
-            _g(df, "Sale Of Investment", col),
-            _g(df, "Interest Received Cfi", col),
-            _g(df, "Dividends Received Cfi", col),
-            _g(df, "Net Other Investing Changes", col),
-            _g(df, "Financing Cash Flow", col),
-            _g(df, "Net Issuance Payments Of Debt", col),
-            _g(df, "Long Term Debt Issuance", col),
-            _g(df, "Long Term Debt Payments", col),
-            _g(df, "Net Short Term Debt Issuance", col),
-            _g(df, "Cash Dividends Paid", col),
-            _g(df, "Interest Paid Cff", col),
-            _g(df, "Common Stock Issuance", col),
-            _g(df, "Net Other Financing Charges", col),
-            _g(df, "Free Cash Flow", col),
-            _g(df, "Beginning Cash Position", col),
-            _g(df, "End Cash Position", col),
-            _g(df, "Changes In Cash", col),
+            symbol, period_end, period_type,
+            gcr("Operating Cash Flow", "Net Cash Provided By Operating Activities"),
+            gcr("Net Income From Continuing Operations", "Net Income Continuous Operations"),
+            gcr("Depreciation And Amortization", "Depreciation Amortization Depletion"),
+            gcr("Change In Working Capital"),
+            gcr("Change In Receivables"),
+            gcr("Change In Inventory"),
+            gcr("Change In Payable", "Change In Payables And Accrued Expense"),
+            gcr("Change In Other Current Assets"),
+            gcr("Change In Other Current Liabilities"),
+            gcr("Other Non Cash Items"),
+            gcr("Taxes Refunds Paid"),
+            gcr("Investing Cash Flow", "Net Cash Used For Investing Activities"),
+            gcr("Capital Expenditure"),
+            gcr("Purchase Of Ppe", "Purchases Of Property Plant And Equipment"),
+            gcr("Sale Of Ppe"),
+            gcr("Acquisition Of Business", "Purchase Of Business"),
+            gcr("Sale Of Business"),
+            gcr("Purchase Of Investment"),
+            gcr("Sale Of Investment"),
+            gcr("Interest Received Cfi"),
+            gcr("Dividends Received Cfi"),
+            gcr("Other Investing Activities"),
+            gcr("Financing Cash Flow", "Net Cash Used Provided By Financing Activities"),
+            gcr("Net Issuance Payments Of Debt", "Net Debt Issuance"),
+            gcr("Long Term Debt Issuance"),
+            gcr("Long Term Debt Payments", "Repayment Of Debt"),
+            gcr("Short Term Debt Net"),
+            gcr("Payment Of Dividends", "Common Stock Dividend Paid"),
+            gcr("Interest Paid Cff"),
+            gcr("Net Common Stock Issuance"),
+            gcr("Other Financing Activities"),
+            gcr("Free Cash Flow"),
+            gcr("Beginning Cash Position"),
+            gcr("End Cash Position"),
+            gcr("Changes In Cash"),
+            0,
         ))
         count += 1
 
     conn.commit()
     conn.close()
-    print(f"  ✅ cash_flow ({period_type}): {count} periods saved")
+    print(f"  ✅ cash_flow ({period_type}): {count} rows upserted (Rs Cr)")

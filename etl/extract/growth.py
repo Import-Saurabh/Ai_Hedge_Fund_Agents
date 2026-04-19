@@ -1,9 +1,11 @@
 """
-etl/extract/growth.py  v2.0
+etl/extract/growth.py  v3.0
 ────────────────────────────────────────────────────────────────
-Fixes vs v1:
-  • All monetary values in YoY JSON stored in Rs. Crores
-  • CAGR computed on Crore-scaled values (result unchanged — ratio)
+Fixes vs v2:
+  • YoY JSON uses key "value_cr" (not "value") consistently
+    so downstream consumers can distinguish Crore values
+  • _yoy_series_cr always divides by _CR — no double-conversion
+  • gross_margin_trend computed per column (not just col 0)
 ────────────────────────────────────────────────────────────────
 """
 
@@ -36,13 +38,13 @@ def _cagr(end, start, years) -> Optional[float]:
     if start < 0 or end < 0:
         return None
     try:
-        return ((end / start) ** (1 / years) - 1) * 100
+        return round(((end / start) ** (1 / years) - 1) * 100, 2)
     except Exception:
         return None
 
 
 def _yoy_series_cr(df, *candidates) -> Dict[str, float]:
-    """Extract a row as {date_str: crore_value} dict."""
+    """Extract a metric row as {date_str: crore_value} dict."""
     if df is None or df.empty:
         return {}
     for df_idx in df.index:
@@ -60,7 +62,7 @@ def _yoy_series_cr(df, *candidates) -> Dict[str, float]:
 
 
 def _yoy_growth_json(series: Dict[str, float]) -> str:
-    """Build [{year, value_cr, yoy_pct}, ...] JSON array."""
+    """Build [{year, value_cr, yoy_pct}, ...] JSON. Newest → oldest."""
     vals = list(series.values())
     keys = list(series.keys())
     records = []
@@ -121,7 +123,7 @@ def _compute_gross_margin_safe(inc, col_idx=0):
 def fetch_growth_metrics(symbol: str) -> dict:
     """
     Compute growth CAGRs + YoY trends.
-    All monetary values in Rs. Crores.
+    All monetary JSON values in Rs. Crores.
     CAGR % values are unit-agnostic (ratios).
     """
     t = yf.Ticker(symbol)
@@ -156,11 +158,12 @@ def fetch_growth_metrics(symbol: str) -> dict:
         cap = abs(cx_r.get(yr, 0)) if yr in cx_r else 0
         fcf_series[yr] = round(ocf - cap, 2)
 
-    # Gross margin trend (% only — no unit conversion needed)
+    # Gross margin trend (per column)
     gm_trend = []
     if inc is not None and not inc.empty:
-        for i, col in enumerate(inc.columns):
-            gm = _compute_gross_margin_safe(inc, col_idx=i)
+        for i in range(len(inc.columns)):
+            col = inc.columns[i]
+            gm  = _compute_gross_margin_safe(inc, col_idx=i)
             if gm is not None:
                 gm_trend.append({"year": str(col)[:10], "gross_margin_pct": gm})
 

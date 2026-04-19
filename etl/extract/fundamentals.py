@@ -1,11 +1,13 @@
 """
-etl/extract/fundamentals.py  v3.0
+etl/extract/fundamentals.py  v4.0
 ────────────────────────────────────────────────────────────────
-Fixes vs v2:
-  • ALL monetary figures stored in Rs. Crores (÷ 1e7)
-  • EV / EV_EBITDA / EV_Revenue always computed when inputs exist
-  • Forward PE and earnings_growth_json always populated
-  • Ratio/% fields (ROE, margins, P/E, P/B, etc.) unchanged — unitless
+Fixes vs v3:
+  • EV / EV_EBITDA / EV_Revenue always computed when mc+debt+cash
+    are available — no longer NULL on first run
+  • forward_pe pulled from info["forwardPE"] with sanity check
+  • earnings_growth_json always populated from annual income stmt
+  • All monetary values confirmed in Rs. Crores before return
+  • TTM figures use last 4 quarterly periods correctly
 ────────────────────────────────────────────────────────────────
 """
 
@@ -27,19 +29,19 @@ _CR = 1e7   # 1 Crore = 10,000,000
 def _safe_float(v) -> Optional[float]:
     try:
         fv = float(v)
-        return None if math.isnan(fv) else fv
+        return None if (math.isnan(fv) or math.isinf(fv)) else fv
     except Exception:
         return None
 
 
 def _cr(v) -> Optional[float]:
-    """Raw rupees → Rs. Crores."""
+    """Raw rupees → Rs. Crores, 2 dp."""
     f = _safe_float(v)
     return round(f / _CR, 2) if f is not None else None
 
 
 def _get_row(df: pd.DataFrame, *candidates, col_idx: int = 0) -> Optional[float]:
-    """Return raw value (NOT converted) — caller decides unit."""
+    """Return first raw value matching any candidate row label."""
     if df is None or df.empty:
         return None
 
@@ -60,7 +62,6 @@ def _get_row(df: pd.DataFrame, *candidates, col_idx: int = 0) -> Optional[float]
                 v = _extract(idx)
                 if v is not None:
                     return v
-
     for name in candidates:
         is_rev = "revenue" in name.lower()
         for idx in df.index:
@@ -118,7 +119,7 @@ def _compute_gross_margin_safe(
                 raw = gp / revenue * 100
                 if 0 <= raw <= 100:
                     gm1 = raw
-                break
+            break
 
     for cand in ["Cost Of Revenue", "Reconciled Cost Of Revenue",
                  "Cost of Goods Sold", "Total Cost Of Revenue"]:
@@ -145,10 +146,32 @@ def _compute_gross_margin_safe(
     return None, revenue, "neither GP nor COGS row found"
 
 
+def _build_earnings_growth_json(inc: pd.DataFrame) -> Optional[str]:
+    """Build {date: net_income_cr} JSON from annual IS. Newest → oldest."""
+    if inc is None or inc.empty:
+        return None
+    ni_row = None
+    for idx in inc.index:
+        if str(idx).lower().strip() in ("net income",
+                                        "net income common stockholders"):
+            ni_row = inc.loc[idx]; break
+    if ni_row is None:
+        for idx in inc.index:
+            if "net income" in str(idx).lower():
+                ni_row = inc.loc[idx]; break
+    if ni_row is None:
+        return None
+    trend = {}
+    for col in inc.columns:
+        v = _cr(_safe_float(ni_row.get(col)))
+        if v is not None:
+            trend[str(col)[:10]] = v
+    return json.dumps(trend) if trend else None
+
+
 def fetch_fundamentals(symbol: str) -> Dict[str, Any]:
     """
     Compute all fundamentals metrics.
-
     MONETARY VALUES → Rs. Crores
     RATIOS / % / P-multiples → unchanged (unitless)
     """
@@ -168,15 +191,15 @@ def fetch_fundamentals(symbol: str) -> Dict[str, Any]:
     price  = _safe_float(info.get("currentPrice") or info.get("regularMarketPrice"))
     shares = _safe_float(info.get("sharesOutstanding"))
 
-    # ── Raw income rows (rupees) ──────────────────────────────
-    revenue_raw  = _get_row(inc, "Total Revenue", "Revenue")
-    net_inc_raw  = _get_row(inc, "Net Income", "Net Income Common Stockholders")
-    ebitda_raw   = _get_row(inc, "EBITDA", "Normalized EBITDA")
-    ebit_raw     = _get_row(inc, "EBIT") or _get_row(inc, "Operating Income")
-    int_exp_raw  = _get_row(inc, "Interest Expense", "Interest Expense Non Operating")
-    dep_raw      = _get_row(inc, "Reconciled Depreciation",
-                             "Depreciation And Amortization In Income Stat",
-                             "Depreciation")
+    # ── Raw income rows ───────────────────────────────────────
+    revenue_raw = _get_row(inc, "Total Revenue", "Revenue")
+    net_inc_raw = _get_row(inc, "Net Income", "Net Income Common Stockholders")
+    ebitda_raw  = _get_row(inc, "EBITDA", "Normalized EBITDA")
+    ebit_raw    = _get_row(inc, "EBIT") or _get_row(inc, "Operating Income")
+    int_exp_raw = _get_row(inc, "Interest Expense", "Interest Expense Non Operating")
+    dep_raw     = _get_row(inc, "Reconciled Depreciation",
+                            "Depreciation And Amortization In Income Stat",
+                            "Depreciation")
 
     # ── Raw BS rows ───────────────────────────────────────────
     total_assets_raw = _get_row(bs, "Total Assets")
@@ -249,9 +272,9 @@ def fetch_fundamentals(symbol: str) -> Dict[str, Any]:
     mc           = _cr(mc_raw)
 
     out: Dict[str, Any] = {}
-    _ebit = ebit or (ebitda * 0.82 if ebitda else None)
+    _ebit = ebit or (round(ebitda * 0.82, 2) if ebitda else None)
 
-    # ── Ratios (unitless) ─────────────────────────────────────
+    # ── Profitability ratios (unitless) ───────────────────────
     if net_inc and total_equity and total_equity != 0:
         out["ROE (%)"] = round(net_inc / total_equity * 100, 2)
     elif info.get("returnOnEquity"):
@@ -268,7 +291,7 @@ def fetch_fundamentals(symbol: str) -> Dict[str, Any]:
     if _ebit and int_exp and int_exp != 0:
         out["Interest Coverage"] = round(abs(_ebit / int_exp), 2)
 
-    # ── FCF in Crores ─────────────────────────────────────────
+    # ── FCF (Crores) ──────────────────────────────────────────
     if op_cf is not None:
         capex_abs = abs(capex_val) if capex_val else 0
         out["Free Cash Flow"] = round(op_cf - capex_abs, 2)
@@ -281,7 +304,6 @@ def fetch_fundamentals(symbol: str) -> Dict[str, Any]:
     gm_pct, _, _ = _compute_gross_margin_safe(inc)
     if gm_pct is not None:
         out["Gross Margin (%)"] = gm_pct
-
     if net_inc and revenue and revenue != 0:
         out["Net Profit Margin (%)"] = round(net_inc / revenue * 100, 2)
     if ebitda and revenue and revenue != 0:
@@ -310,9 +332,7 @@ def fetch_fundamentals(symbol: str) -> Dict[str, Any]:
         )
 
     # ── Valuation ─────────────────────────────────────────────
-    shares_cr = shares / _CR if shares else None    # shares outstanding (not in crores, just raw)
-    # EPS in Rs per share — use raw net income / shares
-    if net_inc_raw and shares and net_inc_raw:
+    if net_inc_raw and shares and shares > 0:
         eps = net_inc_raw / shares
         out["EPS"] = round(eps, 2)
         if price and eps > 0:
@@ -323,15 +343,25 @@ def fetch_fundamentals(symbol: str) -> Dict[str, Any]:
         out["P/B"] = round(price / bv, 2)
 
     if "EPS" in out and bv and out["EPS"] > 0 and bv > 0:
-        import math as _math
-        gn = _math.sqrt(22.5 * out["EPS"] * bv)
+        gn = math.sqrt(22.5 * out["EPS"] * bv)
         out["Graham Number"] = round(gn, 2)
 
     dy = _safe_float(info.get("dividendYield"))
     if dy:
         out["Dividend Yield (%)"] = round(dy * 100, 2)
 
-    # ── EV = Market Cap + Debt − Cash  (all in Crores) ────────
+    # ── Forward PE ────────────────────────────────────────────
+    fwd_pe = _safe_float(info.get("forwardPE"))
+    if fwd_pe is not None and 0 < fwd_pe < 500:
+        out["Forward PE"] = round(fwd_pe, 2)
+
+    # ── EV (Crores) ───────────────────────────────────────────
+    # Resolve total_debt and cash from info if BS gave nothing
+    if total_debt is None:
+        total_debt = _cr(info.get("totalDebt"))
+    if cash is None:
+        cash = _cr(info.get("totalCash"))
+
     if mc is not None and total_debt is not None and cash is not None:
         ev = round(mc + total_debt - cash, 2)
         out["EV"] = ev
@@ -339,11 +369,8 @@ def fetch_fundamentals(symbol: str) -> Dict[str, Any]:
             out["EV/EBITDA"] = round(ev / ebitda, 2)
         if revenue and revenue > 0:
             out["EV/Revenue"] = round(ev / revenue, 2)
-    elif mc_raw and info.get("totalDebt") and info.get("totalCash"):
-        ev = _cr(mc_raw + info["totalDebt"] - info["totalCash"])
-        out["EV"] = ev
 
-    # ── Monetary outputs in Crores ────────────────────────────
+    # ── Monetary scale outputs ────────────────────────────────
     out["Market Cap"]  = mc
     out["Revenue"]     = revenue
     out["Net Income"]  = net_inc
@@ -352,13 +379,18 @@ def fetch_fundamentals(symbol: str) -> Dict[str, Any]:
     out["Total Debt"]  = total_debt
     out["Cash"]        = cash
 
-    # ── TTM EPS from quarterly IS ─────────────────────────────
+    # ── earnings_growth_json ──────────────────────────────────
+    egj = _build_earnings_growth_json(inc)
+    if egj:
+        out["earnings_growth_json"] = egj
+
+    # ── TTM EPS (last 4 quarters) ─────────────────────────────
     try:
         q_inc = t.quarterly_income_stmt
         if q_inc is not None and not q_inc.empty:
             inc_row = next((r for r in q_inc.index
                             if "net income" in str(r).lower()), None)
-            if inc_row and shares:
+            if inc_row and shares and shares > 0:
                 ttm_ni_raw = sum(
                     _safe_float(q_inc.loc[inc_row, c]) or 0
                     for c in q_inc.columns[:4]

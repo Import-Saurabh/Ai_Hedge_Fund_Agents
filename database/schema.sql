@@ -64,47 +64,64 @@ CREATE TABLE IF NOT EXISTS fundamentals (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol                  TEXT NOT NULL REFERENCES stocks(symbol),
     as_of_date              DATE NOT NULL,
+    
     -- Profitability
     roe_pct                 REAL,              -- %
     roce_pct                REAL,
     roa_pct                 REAL,
     interest_coverage       REAL,              -- x
+    
     -- Cash flow
     free_cash_flow          REAL,              -- Rs B
     operating_cf            REAL,
     capex                   REAL,
+    
     -- Margins
     gross_margin_pct        REAL,
     net_profit_margin_pct   REAL,
     ebitda_margin_pct       REAL,
     ebit_margin_pct         REAL,
+    
     -- Leverage & liquidity
     debt_to_equity          REAL,
     current_ratio           REAL,
     quick_ratio             REAL,
+    
     -- Working capital efficiency
     dso_days                REAL,              -- debtor days
     dio_days                REAL,              -- inventory days
     dpo_days                REAL,              -- creditor days
     cash_conversion_cycle   REAL,
+    
     -- Valuation
     eps_annual              REAL,
     pe_ratio                REAL,
     pb_ratio                REAL,
     graham_number           REAL,
     dividend_yield_pct      REAL,
-    -- Scale
+    forward_pe              REAL,              -- Added to match Python code
+    
+    -- Scale / Absolute Values
     market_cap              REAL,              -- Rs B
     revenue                 REAL,
     net_income              REAL,
     ebitda                  REAL,
     inventory               REAL,
-    -- TTM
+    ev                      REAL,              -- Added (Enterprise Value)
+    
+    -- TTM (Trailing Twelve Months)
     ttm_eps                 REAL,
     ttm_pe                  REAL,
+    
+    -- Enterprise Multiples
+    ev_ebitda               REAL,              -- Added
+    ev_revenue              REAL,              -- Added
+    
+    -- Growth & Metadata
+    earnings_growth_json    TEXT,              -- Added (Storing JSON as TEXT)
+    
     UNIQUE (symbol, as_of_date)
 );
-
 -- ────────────────────────────────────────────────────────────
 --  C. FINANCIAL STATEMENTS
 -- ────────────────────────────────────────────────────────────
