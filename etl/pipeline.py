@@ -1,13 +1,14 @@
 """
-BUFFETT-GRADE ETL PIPELINE  v5.4
-Changes vs v5.3:
-  - Screener.in data merged into existing tables via scr_* columns
-  - No separate screener_* tables
-  - income_statement / balance_sheet / cash_flow hold both yfinance
-    detail rows AND Screener summary rows in same table
-  - growth_metrics holds both yf CAGRs + Screener CAGRs
-  - ownership holds latest snapshot; ownership_history holds full
-    quarterly series from Screener
+BUFFETT-GRADE ETL PIPELINE  v5.5
+Changes vs v5.4:
+  - quarterly_results and annual_results are now primary P&L tables
+    (replaced by Screener — not yfinance income_statement quarterly)
+  - Pre/post-insert validation via database.validator
+  - Post-load audit step logs completeness to data_quality_log
+  - cash_flow: best_* columns resolved (fix historical NULL problem)
+  - quarterly_cashflow_derived: quality_score + is_real enforced
+  - growth_metrics: scr_* NULLs diagnosed and flagged
+  - Source priority enforced: Screener > yfinance for Indian stocks
 """
 
 import sys
@@ -17,8 +18,9 @@ from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from database.init_db import init_db
-from database.dedup   import run_all_dedup
+from database.init_db  import init_db
+from database.dedup    import run_all_dedup
+from database.validator import audit_table
 
 from etl.extract.price              import fetch_price
 from etl.extract.fundamentals       import fetch_fundamentals
@@ -35,19 +37,20 @@ from etl.extract.screener           import fetch_screener_data
 from etl.load.stock_loader              import insert_stock
 from etl.load.price_loader              import load_price
 from etl.load.technical_loader          import load_technicals
-from etl.load.fundamentals_loader       import load_fundamentals, load_fundamentals_from_screener
-from etl.load.income_loader             import load_income, load_income_from_screener
-from etl.load.balance_loader            import load_balance, load_balance_from_screener
-from etl.load.cashflow_loader           import load_cashflow, load_cashflow_from_screener
+from etl.load.fundamentals_loader       import load_fundamentals
+from etl.load.income_loader             import load_income
+from etl.load.balance_loader            import load_balance
+from etl.load.cashflow_loader           import load_cashflow
 from etl.load.corporate_actions_loader  import load_corporate_actions
 from etl.load.macro_loader              import (load_market_indices, load_forex_commodities,
                                                 load_rbi_rates, load_macro_indicators)
-from etl.load.ownership_loader          import load_ownership, load_ownership_history
+from etl.load.ownership_loader          import load_ownership
 from etl.load.earnings_loader           import (load_earnings_history, load_earnings_estimates,
                                                 load_eps_trend, load_eps_revisions)
-from etl.load.growth_loader             import load_growth_metrics, load_growth_from_screener
+from etl.load.growth_loader             import load_growth_metrics
 from etl.load.quarterly_cashflow_loader import load_quarterly_cashflow
 from etl.load.run_log_loader            import log_run
+from etl.load.screener_loader           import load_all_screener
 
 
 def run_pipeline(symbol_yf: str = "ADANIPORTS.NS"):
@@ -55,14 +58,21 @@ def run_pipeline(symbol_yf: str = "ADANIPORTS.NS"):
     today      = date.today().isoformat()
     ok_mods, warn_mods = [], []
 
-    print(f"\n=== BUFFETT ETL PIPELINE v5.4 | {symbol_nse} | {today} ===\n")
+    print(f"\n{'='*60}")
+    print(f"  BUFFETT ETL PIPELINE  v5.5")
+    print(f"  Symbol : {symbol_nse}  ({symbol_yf})")
+    print(f"  Date   : {today}")
+    print(f"{'='*60}\n")
 
+    # ── 0. Init DB ─────────────────────────────────────────────
     init_db()
+
+    # ── 1. Seed stock ──────────────────────────────────────────
     insert_stock(symbol_nse, symbol_nse)
     print(f"[1/11] Stock seeded: {symbol_nse}")
 
-    # 2. Price
-    print("\n[2/11] Price data...")
+    # ── 2. Price ───────────────────────────────────────────────
+    print(f"\n[2/11] Price data...")
     price_df = None
     try:
         price_df = fetch_price(symbol_yf, years=5)
@@ -71,8 +81,8 @@ def run_pipeline(symbol_yf: str = "ADANIPORTS.NS"):
     except Exception as e:
         print(f"  error price: {e}"); warn_mods.append("price")
 
-    # 3. Technicals
-    print("\n[3/11] Technical indicators...")
+    # ── 3. Technicals ──────────────────────────────────────────
+    print(f"\n[3/11] Technical indicators...")
     try:
         if price_df is not None and not price_df.empty:
             tech_df = compute_technicals(price_df.copy())
@@ -84,8 +94,8 @@ def run_pipeline(symbol_yf: str = "ADANIPORTS.NS"):
     except Exception as e:
         print(f"  error technicals: {e}"); warn_mods.append("technicals")
 
-    # 4. Fundamentals (yfinance ratios/valuation)
-    print("\n[4/11] Fundamentals (yfinance)...")
+    # ── 4. Fundamentals (yfinance) ─────────────────────────────
+    print(f"\n[4/11] Fundamentals (yfinance ratios/valuation)...")
     try:
         fund_data = fetch_fundamentals(symbol_yf)
         load_fundamentals(symbol_nse, fund_data)
@@ -95,25 +105,27 @@ def run_pipeline(symbol_yf: str = "ADANIPORTS.NS"):
 
     time.sleep(0.5)
 
-    # 5. Financial statements (yfinance detailed line items)
-    print("\n[5/11] Financial statements (yfinance)...")
+    # ── 5. yfinance statements (detailed line items) ───────────
+    print(f"\n[5/11] Financial statements (yfinance detailed)...")
     stmts = {}
     try:
         stmts = fetch_statements(symbol_yf)
-        load_income(stmts.get("annual_income"), symbol_nse, "annual")
-        load_balance(stmts.get("annual_bs"),    symbol_nse, "annual", 0)
-        load_cashflow(stmts.get("annual_cf"),   symbol_nse, "annual")
+        load_income(stmts.get("annual_income"),  symbol_nse, "annual")
+        load_balance(stmts.get("annual_bs"),     symbol_nse, "annual", 0)
+        load_cashflow(stmts.get("annual_cf"),    symbol_nse, "annual")
+
         q_inc = stmts.get("q_income")
         if q_inc is not None and not q_inc.empty:
             load_income(q_inc, symbol_nse, "quarterly")
-        q_bs_ext = stmts.get("q_bs_extended")
-        q_bs_raw = stmts.get("q_bs")
-        q_bs = q_bs_ext if (q_bs_ext is not None and not q_bs_ext.empty) else q_bs_raw
+
+        q_bs = stmts.get("q_bs_extended") or stmts.get("q_bs")
         if q_bs is not None and not q_bs.empty:
             load_balance(q_bs, symbol_nse, "quarterly", 0)
+
         q_cf = stmts.get("q_cf")
         if q_cf is not None and not q_cf.empty:
             load_cashflow(q_cf, symbol_nse, "quarterly")
+
         ok_mods.append("statements_yf")
     except Exception as e:
         print(f"  error statements_yf: {e}"); warn_mods.append("statements_yf")
@@ -121,43 +133,30 @@ def run_pipeline(symbol_yf: str = "ADANIPORTS.NS"):
 
     time.sleep(0.5)
 
-    # 6. Screener.in — merge scr_* columns into existing tables
-    print("\n[6/11] Screener.in (merging into existing tables)...")
+    # ── 6. Screener.in (PRIMARY source for Indian P&L data) ────
+    print(f"\n[6/11] Screener.in (primary financial data source)...")
     screener_data = {}
     try:
         screener_data = fetch_screener_data(symbol_nse)
         if not screener_data:
             raise Exception("empty response from Screener.in")
 
-        if screener_data.get("quarters") is not None:
-            load_income_from_screener(screener_data["quarters"], symbol_nse, "quarterly")
+        load_all_screener(screener_data, symbol_nse)
 
-        if screener_data.get("profit_loss") is not None:
-            load_income_from_screener(screener_data["profit_loss"], symbol_nse, "annual")
-
-        if screener_data.get("balance_sheet") is not None:
-            load_balance_from_screener(screener_data["balance_sheet"], symbol_nse)
-
-        if screener_data.get("cash_flow") is not None:
-            load_cashflow_from_screener(screener_data["cash_flow"], symbol_nse)
-
-        if screener_data.get("ratios") is not None:
-            load_fundamentals_from_screener(screener_data["ratios"], symbol_nse)
-
-        if screener_data.get("growth") is not None:
-            load_growth_from_screener(screener_data["growth"], symbol_nse)
-
-        if screener_data.get("shareholding") is not None:
-            load_ownership_history(screener_data["shareholding"], symbol_nse)
+        # Post-load audit
+        for tbl in ["quarterly_results", "annual_results",
+                    "balance_sheet", "cash_flow", "growth_metrics"]:
+            audit_table(symbol_nse, tbl)
 
         ok_mods.append("screener")
     except Exception as e:
         print(f"  error screener: {e}"); warn_mods.append("screener")
+        import traceback; traceback.print_exc()
 
     time.sleep(0.3)
 
-    # 7. Corporate actions
-    print("\n[7/11] Corporate actions...")
+    # ── 7. Corporate actions ───────────────────────────────────
+    print(f"\n[7/11] Corporate actions...")
     try:
         ca_data = fetch_corporate_actions(symbol_yf)
         load_corporate_actions(ca_data, symbol_nse)
@@ -167,14 +166,13 @@ def run_pipeline(symbol_yf: str = "ADANIPORTS.NS"):
 
     time.sleep(0.3)
 
-    # 8. Macro
-    print("\n[8/11] Macro & market data...")
+    # ── 8. Macro ───────────────────────────────────────────────
+    print(f"\n[8/11] Macro & market data...")
     try:
         mkt = fetch_market_indices()
         load_market_indices(mkt, today)
         load_forex_commodities(mkt, today)
-        rbi = fetch_rbi_rates()
-        load_rbi_rates(rbi)
+        load_rbi_rates(fetch_rbi_rates())
         macro_recs = fetch_macro_indicators()
         if macro_recs:
             load_macro_indicators(macro_recs)
@@ -184,61 +182,72 @@ def run_pipeline(symbol_yf: str = "ADANIPORTS.NS"):
 
     time.sleep(0.3)
 
-    # 9. Ownership
-    print("\n[9/11] Ownership...")
+    # ── 9. Ownership ───────────────────────────────────────────
+    print(f"\n[9/11] Ownership...")
     try:
         screener_sh = screener_data.get("shareholding") if screener_data else None
         own_data = fetch_ownership(symbol_yf, symbol_nse,
                                    screener_shareholding_df=screener_sh)
         load_ownership(own_data, symbol_nse)
+        audit_table(symbol_nse, "ownership_history")
         ok_mods.append("ownership")
     except Exception as e:
         print(f"  error ownership: {e}"); warn_mods.append("ownership")
 
     time.sleep(0.3)
 
-    # 10. Earnings
-    print("\n[10/11] Earnings...")
+    # ── 10. Earnings ───────────────────────────────────────────
+    print(f"\n[10/11] Earnings...")
     try:
         earn = fetch_earnings(symbol_yf)
-        if earn.get("earnings_history"):    load_earnings_history(earn["earnings_history"], symbol_nse)
-        if earn.get("earnings_estimates"):  load_earnings_estimates(earn["earnings_estimates"], symbol_nse)
-        if earn.get("eps_trend"):           load_eps_trend(earn["eps_trend"], symbol_nse)
-        if earn.get("eps_revisions"):       load_eps_revisions(earn["eps_revisions"], symbol_nse)
+        if earn.get("earnings_history"):
+            load_earnings_history(earn["earnings_history"], symbol_nse)
+        if earn.get("earnings_estimates"):
+            load_earnings_estimates(earn["earnings_estimates"], symbol_nse)
+        if earn.get("eps_trend"):
+            load_eps_trend(earn["eps_trend"], symbol_nse)
+        if earn.get("eps_revisions"):
+            load_eps_revisions(earn["eps_revisions"], symbol_nse)
         ok_mods.append("earnings")
     except Exception as e:
         print(f"  error earnings: {e}"); warn_mods.append("earnings")
 
     time.sleep(0.3)
 
-    # 11. Growth + Quarterly FCF
-    print("\n[11/11] Growth metrics & quarterly FCF...")
+    # ── 11. Growth + Quarterly FCF ─────────────────────────────
+    print(f"\n[11/11] Growth + quarterly FCF...")
     try:
         growth = fetch_growth_metrics(symbol_yf)
         load_growth_metrics(growth, symbol_nse)
-        ok_mods.append("growth_metrics")
+        ok_mods.append("growth_metrics_yf")
     except Exception as e:
-        print(f"  error growth_metrics: {e}"); warn_mods.append("growth_metrics")
+        print(f"  error growth_metrics_yf: {e}"); warn_mods.append("growth_metrics_yf")
 
     try:
-        q_inc      = stmts.get("q_income")      if stmts else None
-        q_bs_ext   = stmts.get("q_bs_extended") if stmts else None
-        q_bs_raw   = stmts.get("q_bs")          if stmts else None
-        bs_audit_d = stmts.get("bs_audit", {})  if stmts else {}
+        q_inc    = stmts.get("q_income")      if stmts else None
+        q_bs_ext = stmts.get("q_bs_extended") if stmts else None
+        q_bs_raw = stmts.get("q_bs")          if stmts else None
+
         qcf_records = fetch_quarterly_cashflow(
-            symbol_yf, q_inc=q_inc, q_bs_extended=q_bs_ext,
-            bs_audit=bs_audit_d, q_bs_real=q_bs_raw)
-        real_records = [r for r in qcf_records if r.get("is_interpolated", 0) == 0]
-        if len(qcf_records) - len(real_records):
-            print(f"  skipping {len(qcf_records)-len(real_records)} interpolated rows")
-        if real_records:
-            load_quarterly_cashflow(real_records, symbol_nse)
+            symbol_yf,
+            q_inc=q_inc,
+            q_bs_extended=q_bs_ext,
+            bs_audit=stmts.get("bs_audit", {}),
+            q_bs_real=q_bs_raw,
+        )
+        # Loader enforces quality_score >= 2; is_interpolated=0 always
+        load_quarterly_cashflow(qcf_records, symbol_nse)
+        audit_table(symbol_nse, "quarterly_cashflow_derived")
         ok_mods.append("quarterly_cashflow")
     except Exception as e:
         print(f"  error quarterly_cashflow: {e}"); warn_mods.append("quarterly_cashflow")
 
-    # Dedup
-    print("\n[DEDUP]...")
+    # Final audit on fundamentals and growth
+    audit_table(symbol_nse, "fundamentals")
+    audit_table(symbol_nse, "growth_metrics")
+
+    # ── Dedup ──────────────────────────────────────────────────
+    print(f"\n[DEDUP]...")
     try:
         run_all_dedup()
         print("  dedup complete")
@@ -246,7 +255,12 @@ def run_pipeline(symbol_yf: str = "ADANIPORTS.NS"):
         print(f"  dedup error: {e}")
 
     log_run(symbol_nse, ok_mods, warn_mods)
-    print(f"\n=== DONE | OK: {', '.join(ok_mods)} | WARN: {', '.join(warn_mods) or 'none'} ===")
+
+    print(f"\n{'='*60}")
+    print(f"  PIPELINE COMPLETE  {today}")
+    print(f"  OK   : {', '.join(ok_mods)}")
+    print(f"  WARN : {', '.join(warn_mods) or 'none'}")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":

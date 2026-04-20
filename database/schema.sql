@@ -1,8 +1,15 @@
 -- ============================================================
---  BUFFETT-GRADE STOCK INTELLIGENCE SYSTEM — SQLite Schema v2
---  All Screener.in data merged into existing tables.
---  No separate screener_* tables.
---  Monetary values: Rs. Crores throughout.
+--  BUFFETT-GRADE STOCK INTELLIGENCE SYSTEM — SQLite Schema v3
+--  Key changes vs v2:
+--   • quarterly_results table added (Screener quarterly P&L)
+--   • data_completeness_pct + missing_fields JSON on every
+--     statement table — enforced at insert time
+--   • source_priority columns: scr_* = Screener (authoritative
+--     for Indian stocks), yf_* prefix for yfinance alternatives
+--   • quarterly_cashflow_derived: is_real flag, quality_score
+--   • cash_flow: historical_only flag for screener-only rows
+--   • All scr_* values are authoritative (Screener > yfinance
+--     for Indian listed companies)
 -- ============================================================
 
 PRAGMA journal_mode = WAL;
@@ -15,7 +22,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS stocks (
     symbol          TEXT PRIMARY KEY,
     name            TEXT,
-    exchange        TEXT,
+    exchange        TEXT DEFAULT 'NSE',
     sector          TEXT,
     industry        TEXT,
     currency        TEXT DEFAULT 'INR',
@@ -24,7 +31,7 @@ CREATE TABLE IF NOT EXISTS stocks (
 );
 
 -- ────────────────────────────────────────────────────────────
---  A. PRICE & MARKET DATA
+--  A. PRICE
 -- ────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS price_daily (
@@ -39,25 +46,23 @@ CREATE TABLE IF NOT EXISTS price_daily (
     volume          INTEGER,
     UNIQUE (symbol, date)
 );
-CREATE INDEX IF NOT EXISTS idx_price_daily_sym_date ON price_daily(symbol, date DESC);
+CREATE INDEX IF NOT EXISTS idx_price_sym_date ON price_daily(symbol, date DESC);
 
 CREATE TABLE IF NOT EXISTS price_intraday (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol          TEXT NOT NULL REFERENCES stocks(symbol),
     ts              TIMESTAMP NOT NULL,
     interval        TEXT NOT NULL DEFAULT '1m',
-    open            REAL,
-    high            REAL,
-    low             REAL,
-    close           REAL,
-    volume          INTEGER,
+    open            REAL, high REAL, low REAL, close REAL, volume INTEGER,
     UNIQUE (symbol, ts, interval)
 );
-CREATE INDEX IF NOT EXISTS idx_price_intraday_sym ON price_intraday(symbol, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_price_intra_sym ON price_intraday(symbol, ts DESC);
 
 -- ────────────────────────────────────────────────────────────
---  B. FUNDAMENTALS
---  Screener adds: working_capital_days, source_screener flag
+--  B. FUNDAMENTALS  (point-in-time snapshot)
+--  Source priority: Screener ratios → yfinance fallback
+--  opm_pct, working_capital_days, dividend_payout_pct → Screener
+--  ttm_sales, ttm_net_profit → Screener profit_loss TTM col
 -- ────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS fundamentals (
@@ -67,11 +72,11 @@ CREATE TABLE IF NOT EXISTS fundamentals (
 
     -- Profitability
     roe_pct                 REAL,
-    roce_pct                REAL,       -- also from Screener Ratios sheet
+    roce_pct                REAL,
     roa_pct                 REAL,
     interest_coverage       REAL,
 
-    -- Cash flow
+    -- Cash flow (Rs. Crores)
     free_cash_flow          REAL,
     operating_cf            REAL,
     capex                   REAL,
@@ -81,7 +86,7 @@ CREATE TABLE IF NOT EXISTS fundamentals (
     net_profit_margin_pct   REAL,
     ebitda_margin_pct       REAL,
     ebit_margin_pct         REAL,
-    opm_pct                 REAL,       -- ← Screener: Operating Profit Margin %
+    opm_pct                 REAL,           -- from Screener: OPM % (latest Q)
 
     -- Leverage & liquidity
     debt_to_equity          REAL,
@@ -93,7 +98,7 @@ CREATE TABLE IF NOT EXISTS fundamentals (
     dio_days                REAL,
     dpo_days                REAL,
     cash_conversion_cycle   REAL,
-    working_capital_days    REAL,       -- ← Screener: Working Capital Days
+    working_capital_days    REAL,           -- from Screener Ratios
 
     -- Valuation
     eps_annual              REAL,
@@ -101,51 +106,113 @@ CREATE TABLE IF NOT EXISTS fundamentals (
     pb_ratio                REAL,
     graham_number           REAL,
     dividend_yield_pct      REAL,
-    dividend_payout_pct     REAL,       -- ← Screener: Dividend Payout %
+    dividend_payout_pct     REAL,           -- from Screener P&L (latest annual)
     forward_pe              REAL,
 
-    -- Scale / Absolute Values (Rs. Crores)
+    -- Scale (Rs. Crores)
     market_cap              REAL,
     revenue                 REAL,
     net_income              REAL,
     ebitda                  REAL,
     inventory               REAL,
     ev                      REAL,
-
-    -- TTM
     ttm_eps                 REAL,
     ttm_pe                  REAL,
-    ttm_sales               REAL,       -- ← Screener: TTM Sales (Rs. Crores)
-    ttm_net_profit          REAL,       -- ← Screener: TTM Net Profit
+    ttm_sales               REAL,           -- from Screener P&L TTM column
+    ttm_net_profit          REAL,           -- from Screener P&L TTM column
 
-    -- Enterprise Multiples
+    -- Enterprise multiples
     ev_ebitda               REAL,
     ev_revenue              REAL,
 
-    -- Growth & Metadata
+    -- Growth
     earnings_growth_json    TEXT,
-    data_source             TEXT,       -- 'yfinance' | 'screener' | 'both'
+
+    -- Data quality
+    data_source             TEXT DEFAULT 'yfinance',   -- 'yfinance'|'screener'|'both'
+    completeness_pct        REAL,           -- % of non-NULL key fields
 
     UNIQUE (symbol, as_of_date)
 );
 
 -- ────────────────────────────────────────────────────────────
---  C. FINANCIAL STATEMENTS
---  income_statement: Screener adds expenses, opm_pct,
---    other_income, profit_before_tax, dividend_payout_pct
---  balance_sheet: Screener uses a simplified structure —
---    equity_capital, reserves, borrowings, cwip added
---  cash_flow: Screener adds cash_from_financing,
---    net_cash_flow, cfo_op_pct columns
+--  C1. QUARTERLY RESULTS  (Screener "Quarters" sheet)
+--  This is the authoritative quarterly P&L for Indian stocks.
+--  Source: Screener.in  Unit: Rs. Crores  No yfinance fallback.
+-- ────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS quarterly_results (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol              TEXT NOT NULL REFERENCES stocks(symbol),
+    period_end          DATE NOT NULL,      -- e.g. 2025-03-31
+
+    -- P&L (Rs. Crores)
+    sales               REAL NOT NULL,      -- Revenue
+    expenses            REAL,
+    operating_profit    REAL,
+    opm_pct             REAL,               -- Operating margin %
+    other_income        REAL,
+    interest            REAL,
+    depreciation        REAL,
+    profit_before_tax   REAL,
+    tax_pct             REAL,
+    net_profit          REAL NOT NULL,      -- PAT
+    eps                 REAL,               -- Rs per share
+
+    -- Data quality
+    source              TEXT DEFAULT 'Screener.in',
+    is_audited          INTEGER DEFAULT 0,  -- 0=unaudited Q, 1=audited annual
+    completeness_pct    REAL,
+
+    UNIQUE (symbol, period_end)
+);
+CREATE INDEX IF NOT EXISTS idx_qr_sym ON quarterly_results(symbol, period_end DESC);
+
+-- ────────────────────────────────────────────────────────────
+--  C2. ANNUAL P&L  (Screener "Profit_Loss" sheet)
+--  Authoritative annual income statement for Indian stocks.
+-- ────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS annual_results (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol                  TEXT NOT NULL REFERENCES stocks(symbol),
+    period_end              DATE NOT NULL,      -- Mar YYYY → YYYY-03-31
+
+    -- P&L (Rs. Crores)
+    sales                   REAL NOT NULL,
+    expenses                REAL,
+    operating_profit        REAL,
+    opm_pct                 REAL,
+    other_income            REAL,
+    interest                REAL,
+    depreciation            REAL,
+    profit_before_tax       REAL,
+    tax_pct                 REAL,
+    net_profit              REAL NOT NULL,
+    eps                     REAL,
+    dividend_payout_pct     REAL,
+
+    -- Data quality
+    source                  TEXT DEFAULT 'Screener.in',
+    completeness_pct        REAL,
+
+    UNIQUE (symbol, period_end)
+);
+CREATE INDEX IF NOT EXISTS idx_ar_sym ON annual_results(symbol, period_end DESC);
+
+-- ────────────────────────────────────────────────────────────
+--  C3. INCOME STATEMENT  (yfinance detailed line items)
+--  Detailed breakdown — yfinance primary, Screener summary in
+--  scr_* columns for cross-validation only.
 -- ────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS income_statement (
     id                          INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol                      TEXT NOT NULL REFERENCES stocks(symbol),
     period_end                  DATE NOT NULL,
-    period_type                 TEXT NOT NULL DEFAULT 'annual',  -- 'annual'|'quarterly'
+    period_type                 TEXT NOT NULL DEFAULT 'annual',
 
-    -- yfinance line items (Rs. Crores)
+    -- yfinance detail (Rs. Crores)
     total_revenue               REAL,
     cost_of_revenue             REAL,
     gross_profit                REAL,
@@ -173,26 +240,33 @@ CREATE TABLE IF NOT EXISTS income_statement (
     total_unusual_items         REAL,
     tax_rate                    REAL,
 
-    -- ← Screener columns (Rs. Crores unless noted)
-    scr_sales                   REAL,   -- Screener "Sales" (= revenue)
-    scr_expenses                REAL,   -- Screener "Expenses"
-    scr_operating_profit        REAL,   -- Screener "Operating Profit"
-    scr_opm_pct                 REAL,   -- OPM % (ratio, e.g. 59.0)
-    scr_other_income            REAL,   -- Other Income
-    scr_interest                REAL,   -- Interest expense
-    scr_depreciation            REAL,   -- Depreciation
-    scr_profit_before_tax       REAL,   -- Profit before tax
-    scr_tax_pct                 REAL,   -- Tax % (ratio)
-    scr_net_profit              REAL,   -- Net Profit
-    scr_eps                     REAL,   -- EPS in Rs
-    scr_dividend_payout_pct     REAL,   -- Dividend Payout % (annual only)
+    -- Screener cross-validation (Rs. Crores — these are AUTHORITATIVE)
+    scr_sales                   REAL,
+    scr_expenses                REAL,
+    scr_operating_profit        REAL,
+    scr_opm_pct                 REAL,
+    scr_other_income            REAL,
+    scr_interest                REAL,
+    scr_depreciation            REAL,
+    scr_profit_before_tax       REAL,
+    scr_tax_pct                 REAL,
+    scr_net_profit              REAL,
+    scr_eps                     REAL,
+    scr_dividend_payout_pct     REAL,       -- annual only
 
+    -- Data quality
     is_interpolated             INTEGER DEFAULT 0,
-    data_source                 TEXT DEFAULT 'yfinance',  -- 'yfinance'|'screener'|'both'
+    data_source                 TEXT DEFAULT 'yfinance',
+    completeness_pct            REAL,       -- % of non-NULL yfinance fields
+    missing_fields_json         TEXT,       -- JSON array of NULL field names
 
     UNIQUE (symbol, period_end, period_type)
 );
-CREATE INDEX IF NOT EXISTS idx_is_sym_period ON income_statement(symbol, period_type, period_end DESC);
+CREATE INDEX IF NOT EXISTS idx_is_sym ON income_statement(symbol, period_type, period_end DESC);
+
+-- ────────────────────────────────────────────────────────────
+--  C4. BALANCE SHEET
+-- ────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS balance_sheet (
     id                          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -200,7 +274,7 @@ CREATE TABLE IF NOT EXISTS balance_sheet (
     period_end                  DATE NOT NULL,
     period_type                 TEXT NOT NULL DEFAULT 'annual',
 
-    -- yfinance detailed line items (Rs. Crores)
+    -- yfinance detail (Rs. Crores)
     total_assets                REAL,
     current_assets              REAL,
     cash_and_equivalents        REAL,
@@ -257,24 +331,34 @@ CREATE TABLE IF NOT EXISTS balance_sheet (
     capital_lease_obligations   REAL,
     shares_issued               REAL,
 
-    -- ← Screener columns (Rs. Crores)
-    scr_equity_capital          REAL,   -- Paid-up equity capital
-    scr_reserves                REAL,   -- Reserves & surplus
-    scr_borrowings              REAL,   -- Total borrowings
-    scr_other_liabilities       REAL,   -- Other liabilities
-    scr_total_liabilities       REAL,   -- Screener total liabilities
-    scr_fixed_assets            REAL,   -- Net fixed assets
-    scr_cwip                    REAL,   -- Capital Work In Progress
-    scr_investments             REAL,   -- Investments
-    scr_other_assets            REAL,   -- Other assets
-    scr_total_assets            REAL,   -- Screener total assets
+    -- Screener summary (Rs. Crores — AUTHORITATIVE for Indian stocks)
+    scr_equity_capital          REAL,
+    scr_reserves                REAL,
+    scr_borrowings              REAL,
+    scr_other_liabilities       REAL,
+    scr_total_liabilities       REAL,
+    scr_fixed_assets            REAL,
+    scr_cwip                    REAL,
+    scr_investments             REAL,
+    scr_other_assets            REAL,
+    scr_total_assets            REAL,
 
+    -- Data quality
     is_interpolated             INTEGER DEFAULT 0,
     data_source                 TEXT DEFAULT 'yfinance',
+    completeness_pct            REAL,
+    missing_fields_json         TEXT,
 
     UNIQUE (symbol, period_end, period_type)
 );
-CREATE INDEX IF NOT EXISTS idx_bs_sym_period ON balance_sheet(symbol, period_type, period_end DESC);
+CREATE INDEX IF NOT EXISTS idx_bs_sym ON balance_sheet(symbol, period_type, period_end DESC);
+
+-- ────────────────────────────────────────────────────────────
+--  C5. CASH FLOW
+--  Note: historical rows (pre-2022) often have NULL yfinance
+--  data. scr_* columns fill the gap for annual periods.
+--  Use scr_cash_from_operating for trend analysis.
+-- ────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS cash_flow (
     id                          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -282,7 +366,7 @@ CREATE TABLE IF NOT EXISTS cash_flow (
     period_end                  DATE NOT NULL,
     period_type                 TEXT NOT NULL DEFAULT 'annual',
 
-    -- yfinance detailed line items (Rs. Crores)
+    -- yfinance detail (Rs. Crores) — may be NULL for historical periods
     operating_cash_flow         REAL,
     net_income_ops              REAL,
     depreciation                REAL,
@@ -319,37 +403,62 @@ CREATE TABLE IF NOT EXISTS cash_flow (
     end_cash                    REAL,
     changes_in_cash             REAL,
 
-    -- ← Screener columns (Rs. Crores)
-    scr_cash_from_operating     REAL,   -- Cash from Operating Activity
-    scr_cash_from_investing     REAL,   -- Cash from Investing Activity
-    scr_cash_from_financing     REAL,   -- Cash from Financing Activity
-    scr_net_cash_flow           REAL,   -- Net Cash Flow
-    scr_free_cash_flow          REAL,   -- Free Cash Flow (Screener)
-    scr_cfo_op_pct              REAL,   -- CFO / Operating Profit %
+    -- Screener summary (Rs. Crores — AUTHORITATIVE, covers full history)
+    scr_cash_from_operating     REAL,
+    scr_cash_from_investing     REAL,
+    scr_cash_from_financing     REAL,
+    scr_net_cash_flow           REAL,
+    scr_free_cash_flow          REAL,
+    scr_cfo_op_pct              REAL,       -- CFO / Operating Profit %
 
+    -- Resolved best-available values (filled by loader from scr_* if yf NULL)
+    best_operating_cf           REAL,       -- scr_cash_from_operating ?? operating_cash_flow
+    best_investing_cf           REAL,
+    best_financing_cf           REAL,
+    best_free_cash_flow         REAL,       -- scr_free_cash_flow ?? free_cash_flow
+
+    -- Data quality
     is_interpolated             INTEGER DEFAULT 0,
     data_source                 TEXT DEFAULT 'yfinance',
+    has_yf_detail               INTEGER DEFAULT 0,  -- 1 if yfinance cols populated
+    completeness_pct            REAL,
 
     UNIQUE (symbol, period_end, period_type)
 );
-CREATE INDEX IF NOT EXISTS idx_cf_sym_period ON cash_flow(symbol, period_type, period_end DESC);
+CREATE INDEX IF NOT EXISTS idx_cf_sym ON cash_flow(symbol, period_type, period_end DESC);
 
--- Quarterly FCF derived
+-- ────────────────────────────────────────────────────────────
+--  C6. QUARTERLY CASHFLOW DERIVED
+--  Only real data — no fabrication.
+--  quality_score: 3=direct_qcf, 2=NI+DA_approx, 1=estimated
+--  Do NOT use rows with quality_score < 2 for modelling.
+-- ────────────────────────────────────────────────────────────
+
 CREATE TABLE IF NOT EXISTS quarterly_cashflow_derived (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol              TEXT NOT NULL REFERENCES stocks(symbol),
     quarter_end         DATE NOT NULL,
+
+    -- Source data (Rs. Crores)
     revenue             REAL,
     net_income          REAL,
-    dna                 REAL,
-    approx_op_cf        REAL,
-    approx_capex        REAL,
-    approx_fcf          REAL,
+    dna                 REAL,           -- D&A (must not be 0 — set NULL if unavailable)
+    approx_op_cf        REAL,           -- NULL if not derivable
+    approx_capex        REAL,           -- NULL if not available
+    approx_fcf          REAL,           -- NULL if not derivable
     fcf_margin_pct      REAL,
-    capex_source        TEXT,
-    is_interpolated     INTEGER DEFAULT 0,
+
+    -- Quality metadata
+    capex_source        TEXT,           -- 'direct_qcf' | 'NI+DA_approx' | NULL
+    quality_score       INTEGER DEFAULT 1,  -- 3=direct, 2=NI+DA, 1=estimated
+    is_real             INTEGER DEFAULT 0,  -- 1=from real reported data
+    is_interpolated     INTEGER DEFAULT 0,  -- 1=fabricated — DO NOT MODEL
+    data_note           TEXT,           -- human-readable quality note
+    unit                TEXT DEFAULT 'Rs_Crores',
+
     UNIQUE (symbol, quarter_end)
 );
+CREATE INDEX IF NOT EXISTS idx_qcd_sym ON quarterly_cashflow_derived(symbol, quarter_end DESC);
 
 -- ────────────────────────────────────────────────────────────
 --  D. CORPORATE ACTIONS
@@ -393,19 +502,17 @@ CREATE TABLE IF NOT EXISTS technical_indicators (
     supertrend_dir  INTEGER,
     UNIQUE (symbol, date)
 );
-CREATE INDEX IF NOT EXISTS idx_ti_sym_date ON technical_indicators(symbol, date DESC);
+CREATE INDEX IF NOT EXISTS idx_ti_sym ON technical_indicators(symbol, date DESC);
 
 -- ────────────────────────────────────────────────────────────
---  G. MACRO DATA
+--  F. MACRO
 -- ────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS market_indices (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     snapshot_date   DATE NOT NULL,
     index_name      TEXT NOT NULL,
-    last_price      REAL,
-    change_pct      REAL,
-    direction       TEXT,
+    last_price      REAL, change_pct REAL, direction TEXT,
     UNIQUE (snapshot_date, index_name)
 );
 
@@ -413,23 +520,16 @@ CREATE TABLE IF NOT EXISTS forex_commodities (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     snapshot_date   DATE NOT NULL,
     instrument      TEXT NOT NULL,
-    last_price      REAL,
-    change_pct      REAL,
+    last_price      REAL, change_pct REAL,
     UNIQUE (snapshot_date, instrument)
 );
 
 CREATE TABLE IF NOT EXISTS rbi_rates (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     effective_date  DATE NOT NULL,
-    repo_rate       REAL,
-    reverse_repo    REAL,
-    sdf_rate        REAL,
-    msf_rate        REAL,
-    bank_rate       REAL,
-    crr             REAL,
-    slr             REAL,
-    is_cached       INTEGER DEFAULT 0,
-    source          TEXT,
+    repo_rate       REAL, reverse_repo REAL, sdf_rate REAL,
+    msf_rate        REAL, bank_rate REAL, crr REAL, slr REAL,
+    is_cached       INTEGER DEFAULT 0, source TEXT,
     UNIQUE (effective_date)
 );
 
@@ -437,54 +537,41 @@ CREATE TABLE IF NOT EXISTS macro_indicators (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     snapshot_date   DATE NOT NULL,
     indicator_name  TEXT NOT NULL,
-    source          TEXT,
-    value           REAL,
-    unit            TEXT,
-    year            INTEGER,
-    notes           TEXT,
+    source TEXT, value REAL, unit TEXT, year INTEGER, notes TEXT,
     UNIQUE (snapshot_date, indicator_name, year)
 );
 
 -- ────────────────────────────────────────────────────────────
---  H. OWNERSHIP
---  Screener adds: num_shareholders, scr_promoter_pct history
---  (snapshot per quarter via screener; daily snapshot via yf)
+--  G. OWNERSHIP
 -- ────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS ownership (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol                  TEXT NOT NULL REFERENCES stocks(symbol),
     snapshot_date           DATE NOT NULL,
-
-    -- Screener quarterly pattern (most recent quarter)
     promoter_pct            REAL,
     fii_fpi_pct             REAL,
     dii_pct                 REAL,
     public_retail_pct       REAL,
-    num_shareholders        INTEGER,        -- ← Screener: No. of Shareholders
-
-    -- yfinance breakdown
+    num_shareholders        INTEGER,
     insiders_pct            REAL,
     institutions_pct        REAL,
     institutions_float_pct  REAL,
     institutions_count      INTEGER,
-
-    -- Derived
     total_institutional_pct REAL,
-    fii_net_buy_cr          REAL,           -- daily flow (nselib)
+    fii_net_buy_cr          REAL,
     dii_net_buy_cr          REAL,
     fii_dii_flow_date       TEXT,
     source                  TEXT,
     UNIQUE (symbol, snapshot_date)
 );
 
--- Quarterly shareholding history (one row per quarter from Screener)
--- Stored inline in ownership for latest; full history here:
+-- Full quarterly history (Screener authoritative)
 CREATE TABLE IF NOT EXISTS ownership_history (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol                  TEXT NOT NULL REFERENCES stocks(symbol),
-    period_end              DATE NOT NULL,  -- quarter-end
-    promoter_pct            REAL,
+    period_end              DATE NOT NULL,
+    promoter_pct            REAL NOT NULL,
     fii_pct                 REAL,
     dii_pct                 REAL,
     public_pct              REAL,
@@ -493,65 +580,56 @@ CREATE TABLE IF NOT EXISTS ownership_history (
     source                  TEXT DEFAULT 'Screener.in',
     UNIQUE (symbol, period_end)
 );
-CREATE INDEX IF NOT EXISTS idx_own_hist_sym ON ownership_history(symbol, period_end DESC);
+CREATE INDEX IF NOT EXISTS idx_own_hist ON ownership_history(symbol, period_end DESC);
 
 -- ────────────────────────────────────────────────────────────
---  I. EARNINGS
+--  H. EARNINGS
 -- ────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS earnings_history (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol              TEXT NOT NULL REFERENCES stocks(symbol),
-    quarter_end         DATE NOT NULL,
-    eps_actual          REAL,
-    eps_estimate        REAL,
-    eps_difference      REAL,
-    surprise_pct        REAL,
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol          TEXT NOT NULL REFERENCES stocks(symbol),
+    quarter_end     DATE NOT NULL,
+    eps_actual      REAL, eps_estimate REAL,
+    eps_difference  REAL, surprise_pct REAL,
     UNIQUE (symbol, quarter_end)
 );
 
 CREATE TABLE IF NOT EXISTS earnings_estimates (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol              TEXT NOT NULL REFERENCES stocks(symbol),
-    snapshot_date       DATE NOT NULL,
-    period_code         TEXT NOT NULL,
-    avg_eps             REAL,
-    low_eps             REAL,
-    high_eps            REAL,
-    year_ago_eps        REAL,
-    analyst_count       INTEGER,
-    growth_pct          REAL,
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol          TEXT NOT NULL REFERENCES stocks(symbol),
+    snapshot_date   DATE NOT NULL,
+    period_code     TEXT NOT NULL,
+    avg_eps REAL, low_eps REAL, high_eps REAL,
+    year_ago_eps REAL, analyst_count INTEGER, growth_pct REAL,
     UNIQUE (symbol, snapshot_date, period_code)
 );
 
 CREATE TABLE IF NOT EXISTS eps_trend (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol              TEXT NOT NULL REFERENCES stocks(symbol),
-    snapshot_date       DATE NOT NULL,
-    period_code         TEXT NOT NULL,
-    current_est         REAL,
-    seven_days_ago      REAL,
-    thirty_days_ago     REAL,
-    sixty_days_ago      REAL,
-    ninety_days_ago     REAL,
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol          TEXT NOT NULL REFERENCES stocks(symbol),
+    snapshot_date   DATE NOT NULL,
+    period_code     TEXT NOT NULL,
+    current_est REAL, seven_days_ago REAL, thirty_days_ago REAL,
+    sixty_days_ago REAL, ninety_days_ago REAL,
     UNIQUE (symbol, snapshot_date, period_code)
 );
 
 CREATE TABLE IF NOT EXISTS eps_revisions (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol              TEXT NOT NULL REFERENCES stocks(symbol),
-    snapshot_date       DATE NOT NULL,
-    period_code         TEXT NOT NULL,
-    up_last_7d          INTEGER,
-    up_last_30d         INTEGER,
-    down_last_30d       INTEGER,
-    down_last_7d        INTEGER,
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol          TEXT NOT NULL REFERENCES stocks(symbol),
+    snapshot_date   DATE NOT NULL,
+    period_code     TEXT NOT NULL,
+    up_last_7d INTEGER, up_last_30d INTEGER,
+    down_last_30d INTEGER, down_last_7d INTEGER,
     UNIQUE (symbol, snapshot_date, period_code)
 );
 
 -- ────────────────────────────────────────────────────────────
---  J. GROWTH METRICS
---  Screener growth sheet populates scr_* CAGR columns
+--  I. GROWTH METRICS
+--  scr_* CAGRs come from Screener growth-numbers section.
+--  yf_* CAGRs computed from yfinance income stmt.
+--  All % values.
 -- ────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS growth_metrics (
@@ -559,43 +637,67 @@ CREATE TABLE IF NOT EXISTS growth_metrics (
     symbol                      TEXT NOT NULL REFERENCES stocks(symbol),
     as_of_date                  DATE NOT NULL,
 
-    -- yfinance-derived CAGRs (%)
+    -- yfinance-derived CAGRs (computed from IS)
     revenue_cagr_3y             REAL,
     net_profit_cagr_3y          REAL,
     ebitda_cagr_3y              REAL,
     eps_cagr_3y                 REAL,
     fcf_cagr_3y                 REAL,
 
-    -- YoY JSON arrays
+    -- YoY detail JSON (value_cr + yoy_pct per year)
     revenue_yoy_json            TEXT,
     net_income_yoy_json         TEXT,
     ebitda_yoy_json             TEXT,
     fcf_yoy_json                TEXT,
     gross_margin_trend_json     TEXT,
 
-    -- ← Screener compounded growth (% CAGR, period in label)
-    scr_sales_cagr_10y          REAL,   -- Sales Growth 10 Years
-    scr_sales_cagr_5y           REAL,   -- Sales Growth 5 Years
-    scr_sales_cagr_3y           REAL,   -- Sales Growth 3 Years
-    scr_sales_ttm               REAL,   -- Sales Growth TTM
-    scr_profit_cagr_10y         REAL,   -- Profit Growth 10 Years
+    -- Screener compounded growth (authoritative for Indian stocks)
+    -- period: 10y / 5y / 3y / ttm
+    scr_sales_cagr_10y          REAL,
+    scr_sales_cagr_5y           REAL,
+    scr_sales_cagr_3y           REAL,
+    scr_sales_ttm               REAL,
+    scr_profit_cagr_10y         REAL,
     scr_profit_cagr_5y          REAL,
     scr_profit_cagr_3y          REAL,
     scr_profit_ttm              REAL,
-    scr_stock_cagr_10y          REAL,   -- Stock Price CAGR 10 Years
+    scr_stock_cagr_10y          REAL,
     scr_stock_cagr_5y           REAL,
     scr_stock_cagr_3y           REAL,
     scr_stock_ttm               REAL,
-    scr_roe_10y                 REAL,   -- ROE 10 Year average
+    scr_roe_10y                 REAL,
     scr_roe_5y                  REAL,
     scr_roe_3y                  REAL,
     scr_roe_last                REAL,
+
+    -- Data quality: NULL if Screener growth section unavailable
+    scr_growth_available        INTEGER DEFAULT 0,  -- 1 if scr_* populated
+    completeness_pct            REAL,
 
     UNIQUE (symbol, as_of_date)
 );
 
 -- ────────────────────────────────────────────────────────────
---  AUDIT / RUN LOG
+--  J. DATA QUALITY LOG
+--  One row per table per run — tracks completeness over time.
+-- ────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS data_quality_log (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_timestamp       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    symbol              TEXT NOT NULL,
+    table_name          TEXT NOT NULL,
+    rows_inserted       INTEGER DEFAULT 0,
+    rows_null_heavy     INTEGER DEFAULT 0,  -- rows with completeness < 50%
+    avg_completeness    REAL,
+    critical_nulls_json TEXT,               -- JSON: {field: null_count}
+    source              TEXT,
+    notes               TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_dql_sym ON data_quality_log(symbol, run_timestamp DESC);
+
+-- ────────────────────────────────────────────────────────────
+--  K. RUN LOG
 -- ────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS run_log (
