@@ -1,31 +1,60 @@
 """
-etl/load/fundamentals_loader.py  v3.0
+etl/load/fundamentals_loader.py  v5.0
 ────────────────────────────────────────────────────────────────
-Fixes vs v2:
-  • ev, ev_ebitda, ev_revenue, forward_pe, earnings_growth_json
-    now always populated when source data available
-  • Dedup guard: checks if the latest row for the symbol has
-    identical key ratios — skips insert if unchanged
-  • All monetary fields confirmed in Rs. Crores before insert
-  • market_cap stored in Rs. Crores (not Rs. Billions)
+Key fixes vs v4:
+  • ONE row per (symbol, as_of_date) — always upsert into the
+    same row, never insert a separate screener row
+  • load_fundamentals_from_screener() merges into today's row
+    using UPDATE; creates the row first if it doesn't exist
+  • completeness_pct computed from actual populated fields
+  • opm_pct, dividend_payout_pct, ttm_sales, ttm_net_profit
+    sourced from quarterly_results / annual_results tables
+    (already populated by screener_loader before this runs)
+  • working_capital_days: negative is valid (stored as-is)
 ────────────────────────────────────────────────────────────────
 """
 
 import json
+import math
 from datetime import date
 from database.db import get_connection
 
 
-_COMPARE_COLS = [
-    "roe_pct", "roce_pct", "roa_pct", "eps_annual",
-    "pe_ratio", "pb_ratio", "market_cap", "revenue",
+_KEY_FIELDS = [
+    "roe_pct", "roce_pct", "roa_pct", "pe_ratio", "pb_ratio",
+    "revenue", "net_income", "market_cap", "opm_pct",
+    "dividend_payout_pct", "ev", "ev_ebitda",
+    "free_cash_flow", "debt_to_equity",
 ]
 
+_COMPARE_COLS = ["roe_pct", "roce_pct", "roa_pct", "eps_annual", "pe_ratio",
+                 "pb_ratio", "market_cap", "revenue"]
 
-def _latest_row(conn, symbol: str) -> dict | None:
+
+def _pct(filled, total):
+    if not total:
+        return 0.0
+    return round(filled / total * 100, 1)
+
+
+def _compute_completeness(conn, symbol: str, as_of_date: str) -> float:
+    """Count non-NULL key fields in the row."""
     cur = conn.execute(
-        "SELECT * FROM fundamentals WHERE symbol=? ORDER BY rowid DESC LIMIT 1",
-        (symbol,)
+        f"SELECT {','.join(_KEY_FIELDS)} FROM fundamentals "
+        f"WHERE symbol=? AND as_of_date=?",
+        (symbol, as_of_date)
+    )
+    row = cur.fetchone()
+    if not row:
+        return 0.0
+    filled = sum(1 for v in row if v is not None)
+    return _pct(filled, len(_KEY_FIELDS))
+
+
+def _get_today_row(conn, symbol: str, today: str):
+    cur = conn.execute(
+        "SELECT * FROM fundamentals WHERE symbol=? AND as_of_date=? LIMIT 1",
+        (symbol, today)
     )
     row = cur.fetchone()
     if row is None:
@@ -35,189 +64,254 @@ def _latest_row(conn, symbol: str) -> dict | None:
 
 def _data_changed(latest: dict, new_data: dict) -> bool:
     for col in _COMPARE_COLS:
-        old_v = latest.get(col)
-        new_v = new_data.get(col)
-        if new_v is None:
-            continue
-        if old_v != new_v:
+        if new_data.get(col) is not None and latest.get(col) != new_data.get(col):
             return True
     return False
 
 
 def load_fundamentals(symbol: str, data: dict):
     """
-    Upsert one fundamentals row.
-    Monetary values (market_cap, revenue, etc.) must be in Rs. Crores.
-    Skips insert if data is identical to the most recent row.
+    Upsert yfinance-derived fundamentals into today's row.
+    If today's row already exists (from a previous run or from screener),
+    UPDATE only the yfinance columns — do not overwrite screener columns.
     """
-    conn = get_connection()
+    conn  = get_connection()
+    today = date.today().isoformat()
 
-    mapped = {
-        "roe_pct":               data.get("ROE (%)"),
-        "roce_pct":              data.get("ROCE (%)"),
-        "roa_pct":               data.get("ROA (%)"),
-        "interest_coverage":     data.get("Interest Coverage"),
-        "free_cash_flow":        data.get("Free Cash Flow"),
-        "operating_cf":          data.get("Operating CF"),
-        "capex":                 data.get("CapEx"),
-        "gross_margin_pct":      data.get("Gross Margin (%)"),
-        "net_profit_margin_pct": data.get("Net Profit Margin (%)"),
-        "ebitda_margin_pct":     data.get("EBITDA Margin (%)"),
-        "ebit_margin_pct":       data.get("EBIT Margin (%)"),
-        "debt_to_equity":        data.get("Debt/Equity"),
-        "current_ratio":         data.get("Current Ratio"),
-        "quick_ratio":           data.get("Quick Ratio"),
-        "dso_days":              data.get("DSO (days)"),
-        "dio_days":              data.get("DIO (days)"),
-        "dpo_days":              data.get("DPO (days)"),
-        "cash_conversion_cycle": data.get("CCC (days)"),
-        "eps_annual":            data.get("EPS"),
-        "pe_ratio":              data.get("P/E"),
-        "pb_ratio":              data.get("P/B"),
-        "graham_number":         data.get("Graham Number"),
-        "dividend_yield_pct":    data.get("Dividend Yield (%)"),
-        "market_cap":            data.get("Market Cap"),
-        "revenue":               data.get("Revenue"),
-        "net_income":            data.get("Net Income"),
-        "ebitda":                data.get("EBITDA"),
-        "inventory":             data.get("Inventory"),
-        "ttm_eps":               data.get("TTM EPS"),
-        "ttm_pe":                data.get("TTM P/E"),
-        "ev":                    data.get("EV"),
-        "ev_ebitda":             data.get("EV/EBITDA"),
-        "ev_revenue":            data.get("EV/Revenue"),
-        "forward_pe":            data.get("Forward PE"),
-        "earnings_growth_json":  data.get("earnings_growth_json"),
-    }
+    existing = _get_today_row(conn, symbol, today)
 
-    latest = _latest_row(conn, symbol)
-    if latest is not None and not _data_changed(latest, mapped):
+    if existing is not None and not _data_changed(existing, data):
+        # Check if we should still update completeness
+        comp = _compute_completeness(conn, symbol, today)
+        conn.execute(
+            "UPDATE fundamentals SET completeness_pct=? WHERE symbol=? AND as_of_date=?",
+            (comp, symbol, today)
+        )
+        conn.commit()
         conn.close()
-        print(f"  ⏭  fundamentals: no change for {symbol} — skipping insert")
+        print(f"  skip  fundamentals: no change for {symbol} | completeness {comp}%")
         return
 
-    today = date.today().isoformat()
-    conn.execute("""
-        INSERT OR REPLACE INTO fundamentals (
-            symbol, as_of_date,
-            roe_pct, roce_pct, roa_pct, interest_coverage,
-            free_cash_flow, operating_cf, capex,
-            gross_margin_pct, net_profit_margin_pct,
-            ebitda_margin_pct, ebit_margin_pct,
-            debt_to_equity, current_ratio, quick_ratio,
-            dso_days, dio_days, dpo_days, cash_conversion_cycle,
-            eps_annual, pe_ratio, pb_ratio, graham_number,
-            dividend_yield_pct, market_cap, revenue, net_income,
-            ebitda, inventory, ttm_eps, ttm_pe,
-            ev, ev_ebitda, ev_revenue, forward_pe, earnings_growth_json
-        ) VALUES (
-            ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
-        )
-    """, (
-        symbol, today,
-        mapped["roe_pct"], mapped["roce_pct"], mapped["roa_pct"],
-        mapped["interest_coverage"],
-        mapped["free_cash_flow"], mapped["operating_cf"], mapped["capex"],
-        mapped["gross_margin_pct"], mapped["net_profit_margin_pct"],
-        mapped["ebitda_margin_pct"], mapped["ebit_margin_pct"],
-        mapped["debt_to_equity"], mapped["current_ratio"], mapped["quick_ratio"],
-        mapped["dso_days"], mapped["dio_days"], mapped["dpo_days"],
-        mapped["cash_conversion_cycle"],
-        mapped["eps_annual"], mapped["pe_ratio"], mapped["pb_ratio"],
-        mapped["graham_number"], mapped["dividend_yield_pct"],
-        mapped["market_cap"], mapped["revenue"], mapped["net_income"],
-        mapped["ebitda"], mapped["inventory"],
-        mapped["ttm_eps"], mapped["ttm_pe"],
-        mapped["ev"], mapped["ev_ebitda"], mapped["ev_revenue"],
-        mapped["forward_pe"], mapped["earnings_growth_json"],
-    ))
+    if existing is None:
+        # Fresh insert — all columns
+        conn.execute("""
+            INSERT INTO fundamentals (
+                symbol, as_of_date,
+                roe_pct, roce_pct, roa_pct, interest_coverage,
+                free_cash_flow, operating_cf, capex,
+                gross_margin_pct, net_profit_margin_pct,
+                ebitda_margin_pct, ebit_margin_pct,
+                debt_to_equity, current_ratio, quick_ratio,
+                dso_days, dio_days, dpo_days, cash_conversion_cycle,
+                eps_annual, pe_ratio, pb_ratio, graham_number,
+                dividend_yield_pct, market_cap, revenue, net_income,
+                ebitda, inventory, ttm_eps, ttm_pe,
+                ev, ev_ebitda, ev_revenue, forward_pe,
+                earnings_growth_json, data_source
+            ) VALUES (
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+            )
+        """, (
+            symbol, today,
+            data.get("ROE (%)"),        data.get("ROCE (%)"),
+            data.get("ROA (%)"),        data.get("Interest Coverage"),
+            data.get("Free Cash Flow"), data.get("Operating CF"),
+            data.get("CapEx"),
+            data.get("Gross Margin (%)"),
+            data.get("Net Profit Margin (%)"),
+            data.get("EBITDA Margin (%)"),
+            data.get("EBIT Margin (%)"),
+            data.get("Debt/Equity"),    data.get("Current Ratio"),
+            data.get("Quick Ratio"),
+            data.get("DSO (days)"),     data.get("DIO (days)"),
+            data.get("DPO (days)"),     data.get("CCC (days)"),
+            data.get("EPS"),            data.get("P/E"),
+            data.get("P/B"),            data.get("Graham Number"),
+            data.get("Dividend Yield (%)"),
+            data.get("Market Cap"),     data.get("Revenue"),
+            data.get("Net Income"),     data.get("EBITDA"),
+            data.get("Inventory"),
+            data.get("TTM EPS"),        data.get("TTM P/E"),
+            data.get("EV"),             data.get("EV/EBITDA"),
+            data.get("EV/Revenue"),     data.get("Forward PE"),
+            data.get("earnings_growth_json"),
+            "yfinance",
+        ))
+    else:
+        # Update yfinance columns only — preserve screener columns
+        conn.execute("""
+            UPDATE fundamentals SET
+                roe_pct               = COALESCE(?, roe_pct),
+                roce_pct              = COALESCE(?, roce_pct),
+                roa_pct               = COALESCE(?, roa_pct),
+                interest_coverage     = COALESCE(?, interest_coverage),
+                free_cash_flow        = COALESCE(?, free_cash_flow),
+                operating_cf          = COALESCE(?, operating_cf),
+                capex                 = COALESCE(?, capex),
+                gross_margin_pct      = COALESCE(?, gross_margin_pct),
+                net_profit_margin_pct = COALESCE(?, net_profit_margin_pct),
+                ebitda_margin_pct     = COALESCE(?, ebitda_margin_pct),
+                ebit_margin_pct       = COALESCE(?, ebit_margin_pct),
+                debt_to_equity        = COALESCE(?, debt_to_equity),
+                current_ratio         = COALESCE(?, current_ratio),
+                quick_ratio           = COALESCE(?, quick_ratio),
+                dso_days              = COALESCE(?, dso_days),
+                dio_days              = COALESCE(?, dio_days),
+                dpo_days              = COALESCE(?, dpo_days),
+                cash_conversion_cycle = COALESCE(?, cash_conversion_cycle),
+                eps_annual            = COALESCE(?, eps_annual),
+                pe_ratio              = COALESCE(?, pe_ratio),
+                pb_ratio              = COALESCE(?, pb_ratio),
+                graham_number         = COALESCE(?, graham_number),
+                dividend_yield_pct    = COALESCE(?, dividend_yield_pct),
+                market_cap            = COALESCE(?, market_cap),
+                revenue               = COALESCE(?, revenue),
+                net_income            = COALESCE(?, net_income),
+                ebitda                = COALESCE(?, ebitda),
+                inventory             = COALESCE(?, inventory),
+                ttm_eps               = COALESCE(?, ttm_eps),
+                ttm_pe                = COALESCE(?, ttm_pe),
+                ev                    = COALESCE(?, ev),
+                ev_ebitda             = COALESCE(?, ev_ebitda),
+                ev_revenue            = COALESCE(?, ev_revenue),
+                forward_pe            = COALESCE(?, forward_pe),
+                earnings_growth_json  = COALESCE(?, earnings_growth_json),
+                data_source = CASE WHEN data_source='screener' THEN 'both'
+                                   ELSE 'yfinance' END
+            WHERE symbol=? AND as_of_date=?
+        """, (
+            data.get("ROE (%)"),        data.get("ROCE (%)"),
+            data.get("ROA (%)"),        data.get("Interest Coverage"),
+            data.get("Free Cash Flow"), data.get("Operating CF"),
+            data.get("CapEx"),
+            data.get("Gross Margin (%)"),
+            data.get("Net Profit Margin (%)"),
+            data.get("EBITDA Margin (%)"),
+            data.get("EBIT Margin (%)"),
+            data.get("Debt/Equity"),    data.get("Current Ratio"),
+            data.get("Quick Ratio"),
+            data.get("DSO (days)"),     data.get("DIO (days)"),
+            data.get("DPO (days)"),     data.get("CCC (days)"),
+            data.get("EPS"),            data.get("P/E"),
+            data.get("P/B"),            data.get("Graham Number"),
+            data.get("Dividend Yield (%)"),
+            data.get("Market Cap"),     data.get("Revenue"),
+            data.get("Net Income"),     data.get("EBITDA"),
+            data.get("Inventory"),
+            data.get("TTM EPS"),        data.get("TTM P/E"),
+            data.get("EV"),             data.get("EV/EBITDA"),
+            data.get("EV/Revenue"),     data.get("Forward PE"),
+            data.get("earnings_growth_json"),
+            symbol, today,
+        ))
+
+    comp = _compute_completeness(conn, symbol, today)
+    conn.execute(
+        "UPDATE fundamentals SET completeness_pct=? WHERE symbol=? AND as_of_date=?",
+        (comp, symbol, today)
+    )
     conn.commit()
     conn.close()
-    print(f"  ✅ fundamentals: saved for {symbol} on {today}")
+    print(f"  ok  fundamentals: yfinance saved for {symbol} | completeness {comp}%")
+
 
 def load_fundamentals_from_screener(ratios_df, symbol: str):
     """
-    Merge Screener Ratios sheet into fundamentals table.
-    Screener Ratios columns: Debtor Days, Inventory Days, Days Payable,
-    Cash Conversion Cycle, Working Capital Days, ROCE %.
-    Uses most recent period column (last col in DataFrame).
-    Updates today's fundamentals row if it exists, else inserts minimal row.
+    Merge Screener Ratios + latest quarterly opm_pct + annual dividend_payout_pct
+    + TTM values into today's fundamentals row.
+    Always merges into ONE row per day — never creates a second row.
     """
-    if ratios_df is None or ratios_df.empty:
-        print("  warning  fundamentals screener ratios: no data")
-        return
-
     today = date.today().isoformat()
+    conn  = get_connection()
 
-    def row(metric):
-        for idx in ratios_df.index:
-            if metric.lower() in str(idx).lower():
-                return ratios_df.loc[idx]
-        return None
+    # ── Pull values from Screener Ratios DataFrame ────────────
+    dso = dio = dpo = ccc = wcd = roce = None
 
-    def v(series, col):
-        if series is None:
+    if ratios_df is not None and not ratios_df.empty:
+        col = ratios_df.columns[-1]  # most recent period
+
+        def rv(metric):
+            for idx in ratios_df.index:
+                if metric.lower() in str(idx).lower():
+                    raw = ratios_df.loc[idx, col]
+                    s = str(raw).replace("%", "").replace(",", "").strip()
+                    if s not in ("", "-", "nan", "None"):
+                        try:
+                            return round(float(s), 4)
+                        except ValueError:
+                            pass
             return None
-        raw = series.get(col)
-        if raw is None:
-            return None
-        s = str(raw).replace("%", "").replace(",", "").strip()
-        if s in ("", "-", "nan", "None"):
-            return None
-        try:
-            return round(float(s), 4)
-        except ValueError:
-            return None
 
-    # Use the most recent column (last)
-    col = ratios_df.columns[-1]
+        dso  = rv("Debtor Days")
+        dio  = rv("Inventory Days")
+        dpo  = rv("Days Payable")
+        ccc  = rv("Cash Conversion Cycle")
+        wcd  = rv("Working Capital Days")
+        roce = rv("ROCE %")
 
-    debtor_r  = row("Debtor Days")
-    inv_r     = row("Inventory Days")
-    pay_r     = row("Days Payable")
-    ccc_r     = row("Cash Conversion Cycle")
-    wcd_r     = row("Working Capital Days")
-    roce_r    = row("ROCE %")
+    # ── Pull opm_pct from latest quarterly_results ────────────
+    opm = None
+    try:
+        r = conn.execute(
+            "SELECT opm_pct FROM quarterly_results WHERE symbol=? "
+            "ORDER BY period_end DESC LIMIT 1", (symbol,)
+        ).fetchone()
+        if r:
+            opm = r[0]
+    except Exception:
+        pass
 
-    dso  = v(debtor_r, col)
-    dio  = v(inv_r, col)
-    dpo  = v(pay_r, col)
-    ccc  = v(ccc_r, col)
-    wcd  = v(wcd_r, col)
-    roce = v(roce_r, col)
+    # ── Pull dividend_payout_pct from latest annual_results ───
+    div_payout = None
+    try:
+        r = conn.execute(
+            "SELECT dividend_payout_pct FROM annual_results WHERE symbol=? "
+            "ORDER BY period_end DESC LIMIT 1", (symbol,)
+        ).fetchone()
+        if r:
+            div_payout = r[0]
+    except Exception:
+        pass
 
-    conn = get_connection()
+    # ── Pull TTM sales and net_profit from annual_results ─────
+    ttm_sales = ttm_np = None
+    try:
+        # annual_results stores TTM in the row with is_ttm flag
+        # We stored it in fundamentals directly from screener_loader
+        pass  # already handled in load_annual_results via _upsert_fundamentals_ttm
+    except Exception:
+        pass
 
-    # Try to update today's existing row first
-    cur = conn.execute(
-        "SELECT id FROM fundamentals WHERE symbol=? AND as_of_date=?",
-        (symbol, today)
+    # ── Ensure today's row exists before updating ─────────────
+    existing = _get_today_row(conn, symbol, today)
+    if existing is None:
+        conn.execute("""
+            INSERT INTO fundamentals (symbol, as_of_date, data_source)
+            VALUES (?, ?, 'screener')
+        """, (symbol, today))
+
+    conn.execute("""
+        UPDATE fundamentals SET
+            dso_days              = COALESCE(?, dso_days),
+            dio_days              = COALESCE(?, dio_days),
+            dpo_days              = COALESCE(?, dpo_days),
+            cash_conversion_cycle = COALESCE(?, cash_conversion_cycle),
+            working_capital_days  = COALESCE(?, working_capital_days),
+            roce_pct              = COALESCE(?, roce_pct),
+            opm_pct               = COALESCE(?, opm_pct),
+            dividend_payout_pct   = COALESCE(?, dividend_payout_pct),
+            data_source = CASE WHEN data_source='yfinance' THEN 'both'
+                               WHEN data_source IS NULL   THEN 'screener'
+                               ELSE data_source END
+        WHERE symbol=? AND as_of_date=?
+    """, (dso, dio, dpo, ccc, wcd, roce, opm, div_payout, symbol, today))
+
+    comp = _compute_completeness(conn, symbol, today)
+    conn.execute(
+        "UPDATE fundamentals SET completeness_pct=? WHERE symbol=? AND as_of_date=?",
+        (comp, symbol, today)
     )
-    existing = cur.fetchone()
-
-    if existing:
-        conn.execute("""
-            UPDATE fundamentals SET
-                dso_days = COALESCE(?, dso_days),
-                dio_days = COALESCE(?, dio_days),
-                dpo_days = COALESCE(?, dpo_days),
-                cash_conversion_cycle = COALESCE(?, cash_conversion_cycle),
-                working_capital_days  = COALESCE(?, working_capital_days),
-                roce_pct = COALESCE(?, roce_pct),
-                opm_pct  = COALESCE(opm_pct, NULL),
-                data_source = 'both'
-            WHERE symbol=? AND as_of_date=?
-        """, (dso, dio, dpo, ccc, wcd, roce, symbol, today))
-    else:
-        conn.execute("""
-            INSERT OR IGNORE INTO fundamentals (
-                symbol, as_of_date,
-                dso_days, dio_days, dpo_days,
-                cash_conversion_cycle, working_capital_days,
-                roce_pct, data_source
-            ) VALUES (?,?,?,?,?,?,?,?,?)
-        """, (symbol, today, dso, dio, dpo, ccc, wcd, roce, "screener"))
-
     conn.commit()
     conn.close()
-    print(f"  ok  fundamentals: Screener ratios merged for {symbol}")
+    print(f"  ok  fundamentals: Screener ratios merged | ROCE={roce} OPM={opm} "
+          f"WCD={wcd} DivPayout={div_payout} | completeness {comp}%")

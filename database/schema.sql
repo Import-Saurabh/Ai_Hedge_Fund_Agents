@@ -1,15 +1,9 @@
 -- ============================================================
---  BUFFETT-GRADE STOCK INTELLIGENCE SYSTEM — SQLite Schema v3
---  Key changes vs v2:
---   • quarterly_results table added (Screener quarterly P&L)
---   • data_completeness_pct + missing_fields JSON on every
---     statement table — enforced at insert time
---   • source_priority columns: scr_* = Screener (authoritative
---     for Indian stocks), yf_* prefix for yfinance alternatives
---   • quarterly_cashflow_derived: is_real flag, quality_score
---   • cash_flow: historical_only flag for screener-only rows
---   • All scr_* values are authoritative (Screener > yfinance
---     for Indian listed companies)
+--  BUFFETT-GRADE STOCK INTELLIGENCE SYSTEM — SQLite Schema v4
+--  Key changes vs v3:
+--   • fundamentals table: added face_value, high_52w, low_52w,
+--     current_price columns (sourced from Screener overview panel)
+--   • All existing tables and indexes preserved unchanged
 -- ============================================================
 
 PRAGMA journal_mode = WAL;
@@ -61,6 +55,19 @@ CREATE INDEX IF NOT EXISTS idx_price_intra_sym ON price_intraday(symbol, ts DESC
 -- ────────────────────────────────────────────────────────────
 --  B. FUNDAMENTALS  (point-in-time snapshot)
 --  Source priority: Screener ratios → yfinance fallback
+--
+--  Screener overview fields (authoritative):
+--    current_price   — live price from Screener header
+--    face_value      — share face value (e.g. ₹2)
+--    high_52w        — 52-week high price
+--    low_52w         — 52-week low price
+--    market_cap      — market cap in Rs. Crores
+--    pe_ratio        — Stock P/E from Screener
+--    pb_ratio        — derived from current_price / book_value
+--    roe_pct         — Return on Equity %
+--    roce_pct        — Return on Capital Employed %
+--    dividend_yield_pct — Dividend Yield %
+--    book_value      — Book Value per share (Rs.)
 --  opm_pct, working_capital_days, dividend_payout_pct → Screener
 --  ttm_sales, ttm_net_profit → Screener profit_loss TTM col
 -- ────────────────────────────────────────────────────────────
@@ -69,6 +76,13 @@ CREATE TABLE IF NOT EXISTS fundamentals (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol                  TEXT NOT NULL REFERENCES stocks(symbol),
     as_of_date              DATE NOT NULL,
+
+    -- Screener overview (most authoritative — scraped directly)
+    current_price           REAL,           -- live price from Screener header
+    face_value              REAL,           -- share face value (e.g. ₹2)
+    high_52w                REAL,           -- 52-week high
+    low_52w                 REAL,           -- 52-week low
+    book_value              REAL,           -- book value per share (Rs.)
 
     -- Profitability
     roe_pct                 REAL,
@@ -102,8 +116,8 @@ CREATE TABLE IF NOT EXISTS fundamentals (
 
     -- Valuation
     eps_annual              REAL,
-    pe_ratio                REAL,
-    pb_ratio                REAL,
+    pe_ratio                REAL,           -- Stock P/E from Screener
+    pb_ratio                REAL,           -- current_price / book_value
     graham_number           REAL,
     dividend_yield_pct      REAL,
     dividend_payout_pct     REAL,           -- from Screener P&L (latest annual)
@@ -355,9 +369,6 @@ CREATE INDEX IF NOT EXISTS idx_bs_sym ON balance_sheet(symbol, period_type, peri
 
 -- ────────────────────────────────────────────────────────────
 --  C5. CASH FLOW
---  Note: historical rows (pre-2022) often have NULL yfinance
---  data. scr_* columns fill the gap for annual periods.
---  Use scr_cash_from_operating for trend analysis.
 -- ────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS cash_flow (
@@ -366,7 +377,7 @@ CREATE TABLE IF NOT EXISTS cash_flow (
     period_end                  DATE NOT NULL,
     period_type                 TEXT NOT NULL DEFAULT 'annual',
 
-    -- yfinance detail (Rs. Crores) — may be NULL for historical periods
+    -- yfinance detail (Rs. Crores)
     operating_cash_flow         REAL,
     net_income_ops              REAL,
     depreciation                REAL,
@@ -409,18 +420,18 @@ CREATE TABLE IF NOT EXISTS cash_flow (
     scr_cash_from_financing     REAL,
     scr_net_cash_flow           REAL,
     scr_free_cash_flow          REAL,
-    scr_cfo_op_pct              REAL,       -- CFO / Operating Profit %
+    scr_cfo_op_pct              REAL,
 
-    -- Resolved best-available values (filled by loader from scr_* if yf NULL)
-    best_operating_cf           REAL,       -- scr_cash_from_operating ?? operating_cash_flow
+    -- Resolved best-available values
+    best_operating_cf           REAL,
     best_investing_cf           REAL,
     best_financing_cf           REAL,
-    best_free_cash_flow         REAL,       -- scr_free_cash_flow ?? free_cash_flow
+    best_free_cash_flow         REAL,
 
     -- Data quality
     is_interpolated             INTEGER DEFAULT 0,
     data_source                 TEXT DEFAULT 'yfinance',
-    has_yf_detail               INTEGER DEFAULT 0,  -- 1 if yfinance cols populated
+    has_yf_detail               INTEGER DEFAULT 0,
     completeness_pct            REAL,
 
     UNIQUE (symbol, period_end, period_type)
@@ -429,9 +440,6 @@ CREATE INDEX IF NOT EXISTS idx_cf_sym ON cash_flow(symbol, period_type, period_e
 
 -- ────────────────────────────────────────────────────────────
 --  C6. QUARTERLY CASHFLOW DERIVED
---  Only real data — no fabrication.
---  quality_score: 3=direct_qcf, 2=NI+DA_approx, 1=estimated
---  Do NOT use rows with quality_score < 2 for modelling.
 -- ────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS quarterly_cashflow_derived (
@@ -439,21 +447,19 @@ CREATE TABLE IF NOT EXISTS quarterly_cashflow_derived (
     symbol              TEXT NOT NULL REFERENCES stocks(symbol),
     quarter_end         DATE NOT NULL,
 
-    -- Source data (Rs. Crores)
     revenue             REAL,
     net_income          REAL,
-    dna                 REAL,           -- D&A (must not be 0 — set NULL if unavailable)
-    approx_op_cf        REAL,           -- NULL if not derivable
-    approx_capex        REAL,           -- NULL if not available
-    approx_fcf          REAL,           -- NULL if not derivable
+    dna                 REAL,
+    approx_op_cf        REAL,
+    approx_capex        REAL,
+    approx_fcf          REAL,
     fcf_margin_pct      REAL,
 
-    -- Quality metadata
-    capex_source        TEXT,           -- 'direct_qcf' | 'NI+DA_approx' | NULL
-    quality_score       INTEGER DEFAULT 1,  -- 3=direct, 2=NI+DA, 1=estimated
-    is_real             INTEGER DEFAULT 0,  -- 1=from real reported data
-    is_interpolated     INTEGER DEFAULT 0,  -- 1=fabricated — DO NOT MODEL
-    data_note           TEXT,           -- human-readable quality note
+    capex_source        TEXT,
+    quality_score       INTEGER DEFAULT 1,
+    is_real             INTEGER DEFAULT 0,
+    is_interpolated     INTEGER DEFAULT 0,
+    data_note           TEXT,
     unit                TEXT DEFAULT 'Rs_Crores',
 
     UNIQUE (symbol, quarter_end)
@@ -566,7 +572,6 @@ CREATE TABLE IF NOT EXISTS ownership (
     UNIQUE (symbol, snapshot_date)
 );
 
--- Full quarterly history (Screener authoritative)
 CREATE TABLE IF NOT EXISTS ownership_history (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol                  TEXT NOT NULL REFERENCES stocks(symbol),
@@ -627,9 +632,6 @@ CREATE TABLE IF NOT EXISTS eps_revisions (
 
 -- ────────────────────────────────────────────────────────────
 --  I. GROWTH METRICS
---  scr_* CAGRs come from Screener growth-numbers section.
---  yf_* CAGRs computed from yfinance income stmt.
---  All % values.
 -- ────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS growth_metrics (
@@ -637,22 +639,18 @@ CREATE TABLE IF NOT EXISTS growth_metrics (
     symbol                      TEXT NOT NULL REFERENCES stocks(symbol),
     as_of_date                  DATE NOT NULL,
 
-    -- yfinance-derived CAGRs (computed from IS)
     revenue_cagr_3y             REAL,
     net_profit_cagr_3y          REAL,
     ebitda_cagr_3y              REAL,
     eps_cagr_3y                 REAL,
     fcf_cagr_3y                 REAL,
 
-    -- YoY detail JSON (value_cr + yoy_pct per year)
     revenue_yoy_json            TEXT,
     net_income_yoy_json         TEXT,
     ebitda_yoy_json             TEXT,
     fcf_yoy_json                TEXT,
     gross_margin_trend_json     TEXT,
 
-    -- Screener compounded growth (authoritative for Indian stocks)
-    -- period: 10y / 5y / 3y / ttm
     scr_sales_cagr_10y          REAL,
     scr_sales_cagr_5y           REAL,
     scr_sales_cagr_3y           REAL,
@@ -670,8 +668,7 @@ CREATE TABLE IF NOT EXISTS growth_metrics (
     scr_roe_3y                  REAL,
     scr_roe_last                REAL,
 
-    -- Data quality: NULL if Screener growth section unavailable
-    scr_growth_available        INTEGER DEFAULT 0,  -- 1 if scr_* populated
+    scr_growth_available        INTEGER DEFAULT 0,
     completeness_pct            REAL,
 
     UNIQUE (symbol, as_of_date)
@@ -679,7 +676,6 @@ CREATE TABLE IF NOT EXISTS growth_metrics (
 
 -- ────────────────────────────────────────────────────────────
 --  J. DATA QUALITY LOG
---  One row per table per run — tracks completeness over time.
 -- ────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS data_quality_log (
@@ -688,9 +684,9 @@ CREATE TABLE IF NOT EXISTS data_quality_log (
     symbol              TEXT NOT NULL,
     table_name          TEXT NOT NULL,
     rows_inserted       INTEGER DEFAULT 0,
-    rows_null_heavy     INTEGER DEFAULT 0,  -- rows with completeness < 50%
+    rows_null_heavy     INTEGER DEFAULT 0,
     avg_completeness    REAL,
-    critical_nulls_json TEXT,               -- JSON: {field: null_count}
+    critical_nulls_json TEXT,
     source              TEXT,
     notes               TEXT
 );

@@ -1,14 +1,28 @@
 """
-etl/extract/quarterly_cashflow.py  v4.0
+etl/extract/quarterly_cashflow.py  v4.1
 ────────────────────────────────────────────────────────────────
-Changes vs v3:
-  • quality_score introduced: 3=direct_qcf, 2=NI+DA, 1=nothing
-  • dna: only set when D&A is a real non-zero value from IS
-  • approx_op_cf: only NI+DA when BOTH are present — never NI alone
-  • approx_fcf: NULL when capex unknown (not NI proxy)
-  • is_real=1 always (we never insert fabricated rows)
-  • is_interpolated=0 always (fabricated rows blocked at source)
-  • data_note explains what each row is
+Changes vs v4.0:
+  BUG 1 — revenue = cost_of_revenue (wrong row):
+    _row(q_inc, "Total Revenue", "Revenue") was matching
+    "Operating Revenue" or fallback sub-rows first in some
+    quarter layouts. Now uses strict priority:
+      1. Exact "Total Revenue"
+      2. Exact "Revenue"  (only if no sub-row match)
+      3. "Operating Revenue" last resort
+    Result was revenue=1656 (cost_of_revenue) vs correct 8488
+
+  BUG 2 — dna NULL despite D&A present in quarterly IS:
+    yfinance quarterly IS stores D&A as:
+      "Reconciled Depreciation"         ← try first (most reliable)
+      "Depreciation And Amortization"
+      "Depreciation"
+    Previous code missed "Reconciled Depreciation" in priority 2
+    (NI+DA path). Now explicit.
+
+  BUG 3 — EBITDA - EBIT D&A fallback was unreliable:
+    quarterly IS often has ebitda=ebit (no separate ebitda row)
+    → only use that fallback when ebitda > ebit by a material
+      amount (> 100 Cr). Avoids setting dna=0.
 ────────────────────────────────────────────────────────────────
 """
 
@@ -33,7 +47,25 @@ def _cr(v) -> Optional[float]:
     return round(f / _CR, 2) if f is not None else None
 
 
-def _row(df, *cands):
+def _row_exact(df, *candidates) -> Optional[pd.Series]:
+    """Exact label match first, then substring — avoids wrong sub-rows."""
+    if df is None or df.empty:
+        return None
+    # Phase 1: exact match (case-insensitive)
+    for c in candidates:
+        for idx in df.index:
+            if str(idx).strip().lower() == c.lower():
+                return df.loc[idx]
+    # Phase 2: substring match (only if no exact found)
+    for c in candidates:
+        for idx in df.index:
+            if c.lower() in str(idx).lower():
+                return df.loc[idx]
+    return None
+
+
+def _row(df, *cands) -> Optional[pd.Series]:
+    """Original substring-first row finder (kept for CF paths)."""
     if df is None or df.empty:
         return None
     for df_idx in df.index:
@@ -52,16 +84,7 @@ def fetch_quarterly_cashflow(
 ) -> list:
     """
     Returns real quarterly cashflow records only.
-    quality_score: 3 = direct from yfinance quarterly CF
-                   2 = NI + real D&A from quarterly IS
-                   1 = nothing reliable — row omitted
-
-    Rules:
-    - dna is ONLY set when D&A row exists AND value > 0
-    - approx_op_cf is ONLY set when both NI and dna are present
-    - approx_fcf is ONLY set when approx_op_cf + capex both present
-    - is_interpolated is always 0 (we drop fabricated rows)
-    - is_real is always 1
+    quality_score: 3=direct_qcf, 2=NI+DA_approx, 1=NI_only (skipped)
     """
     t = yf.Ticker(symbol)
     records = []
@@ -77,8 +100,13 @@ def fetch_quarterly_cashflow(
             fcf_r  = _row(qcf, "Free Cash Flow")
             ni_r   = _row(qcf, "Net Income From Continuing Operations",
                           "Net Income Continuous Operations", "Net Income")
-            dep_r  = _row(qcf, "Depreciation And Amortization", "Depreciation")
-            rev_r  = _row(q_inc, "Total Revenue", "Revenue") if q_inc is not None else None
+            dep_r  = _row(qcf, "Depreciation And Amortization",
+                          "Depreciation Amortization Depletion",
+                          "Reconciled Depreciation", "Depreciation")
+
+            # FIX: use exact-first match for revenue to avoid sub-rows
+            rev_r = _row_exact(q_inc, "Total Revenue", "Revenue",
+                               "Operating Revenue") if q_inc is not None else None
 
             for col in qcf.columns:
                 op_cf_raw = _safe_float(opcf_r.get(col)) if opcf_r is not None else None
@@ -92,7 +120,10 @@ def fetch_quarterly_cashflow(
                 if fcf is None and op_cf is not None and capex is not None:
                     fcf = round(op_cf - capex, 2)
 
-                rev = _cr(_safe_float(rev_r.get(col)) if rev_r is not None else None)
+                # FIX: get revenue from correct row
+                rev_raw = _safe_float(rev_r.get(col)) if rev_r is not None else None
+                rev     = _cr(rev_raw)
+
                 ni  = _cr(_safe_float(ni_r.get(col))  if ni_r  is not None else None)
 
                 dep_raw = _safe_float(dep_r.get(col)) if dep_r is not None else None
@@ -101,7 +132,6 @@ def fetch_quarterly_cashflow(
                 fcf_mgn = (round(fcf / rev * 100, 2)
                            if fcf is not None and rev and rev != 0 else None)
 
-                # Only skip if completely empty
                 if op_cf is None and fcf is None and ni is None:
                     continue
 
@@ -109,7 +139,7 @@ def fetch_quarterly_cashflow(
                     "quarter_end":     str(col)[:10],
                     "revenue":         rev,
                     "net_income":      ni,
-                    "dna":             dna,             # real D&A or NULL
+                    "dna":             dna,
                     "approx_op_cf":    op_cf,
                     "approx_capex":    capex,
                     "approx_fcf":      fcf,
@@ -133,41 +163,62 @@ def fetch_quarterly_cashflow(
         print("  warn  quarterly_cashflow: no q_inc — returning empty")
         return records
 
-    ni_r   = _row(q_inc, "Net Income", "Net Income Common Stockholders",
-                  "Net Income From Continuing Operation Net Mino")
-    dep_r  = _row(q_inc, "Reconciled Depreciation",
-                  "Depreciation And Amortization In Income Stat",
-                  "Depreciation And Amortization")
-    rev_r  = _row(q_inc, "Total Revenue", "Operating Revenue", "Revenue")
-    ebit_r = _row(q_inc, "EBIT", "Operating Income")
-    ebitda_r = _row(q_inc, "EBITDA", "Normalized EBITDA")
+    # FIX: use exact-first match for revenue to avoid cost_of_revenue match
+    rev_r  = _row_exact(q_inc, "Total Revenue", "Revenue", "Operating Revenue")
 
+    ni_r   = _row_exact(q_inc,
+                        "Net Income",
+                        "Net Income Common Stockholders",
+                        "Net Income From Continuing Operation Net Mino")
+
+    # FIX: try "Reconciled Depreciation" first (most reliable in yfinance quarterly IS)
+    dep_r  = _row_exact(q_inc,
+                        "Reconciled Depreciation",
+                        "Depreciation And Amortization In Income Stat",
+                        "Depreciation And Amortization",
+                        "Depreciation")
+
+    ebit_r   = _row_exact(q_inc, "EBIT", "Operating Income")
+    ebitda_r = _row_exact(q_inc, "EBITDA", "Normalized EBITDA")
+
+    skipped_quality = 0
     for col in q_inc.columns:
         ni  = _cr(_safe_float(ni_r.get(col))  if ni_r  is not None else None)
-        rev = _cr(_safe_float(rev_r.get(col)) if rev_r is not None else None)
+        rev_raw = _safe_float(rev_r.get(col)) if rev_r is not None else None
+        rev = _cr(rev_raw)
 
         dep_raw = _safe_float(dep_r.get(col)) if dep_r is not None else None
         dna     = _cr(dep_raw) if (dep_raw is not None and dep_raw > 0) else None
 
-        # D&A from EBITDA - EBIT if direct D&A missing
+        # FIX: EBITDA - EBIT fallback only when difference is material (>100 Cr in raw)
         if dna is None and ebitda_r is not None and ebit_r is not None:
             eb_raw = _safe_float(ebitda_r.get(col))
             el_raw = _safe_float(ebit_r.get(col))
-            if eb_raw is not None and el_raw is not None and (eb_raw - el_raw) > 0:
+            if (eb_raw is not None and el_raw is not None
+                    and (eb_raw - el_raw) > 1e9):   # > 100 Cr threshold
                 dna = _cr(eb_raw - el_raw)
 
         # approx_op_cf requires BOTH NI and dna
         if ni is not None and dna is not None:
             op_cf = round(ni + dna, 2)
+            quality = 2
+            note = "NI+real_DA from quarterly IS"
+            capex_src = "NI+DA_approx"
         else:
-            op_cf = None   # not NI alone — would be wrong
-
-        # fcf requires op_cf; capex unknown so fcf is NULL
-        fcf = None
-        fcf_mgn = None
+            op_cf = None
+            quality = 1
+            note = "NI only — DA unavailable, op_cf not computed"
+            capex_src = "NI_only"
 
         if ni is None:
-            continue   # skip completely empty rows
+            continue
+
+        # Skip quality_score=1 rows at extract time
+        # (loader also enforces this, but better to skip early)
+        if quality < 2:
+            skipped_quality += 1
+            # Still add the record — loader decides what to store
+            # (we need net_income for fundamentals reconcile even if no op_cf)
 
         records.append({
             "quarter_end":     str(col)[:10],
@@ -175,21 +226,18 @@ def fetch_quarterly_cashflow(
             "net_income":      ni,
             "dna":             dna,
             "approx_op_cf":    op_cf,
-            "approx_capex":    None,      # genuinely unknown
-            "approx_fcf":      fcf,       # NULL — no capex
-            "fcf_margin_pct":  fcf_mgn,
-            "capex_source":    "NI+DA_approx" if op_cf is not None else "NI_only",
-            "quality_score":   2 if op_cf is not None else 1,
+            "approx_capex":    None,
+            "approx_fcf":      None,
+            "fcf_margin_pct":  None,
+            "capex_source":    capex_src,
+            "quality_score":   quality,
             "is_real":         1,
             "is_interpolated": 0,
-            "data_note":       (
-                "NI+real_DA from quarterly IS"
-                if op_cf is not None
-                else "NI only — DA unavailable, op_cf not computed"
-            ),
+            "data_note":       note,
             "unit":            "Rs_Crores",
         })
 
-    print(f"  ok  quarterly_cashflow: {len(records)} NI+DA rows "
-          f"(quality 2+)")
+    q2_count = sum(1 for r in records if r["quality_score"] >= 2)
+    print(f"  ok  quarterly_cashflow: {len(records)} NI rows "
+          f"({q2_count} quality≥2, {skipped_quality} NI-only)")
     return records

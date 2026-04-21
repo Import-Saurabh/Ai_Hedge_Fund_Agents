@@ -1,14 +1,17 @@
 """
-BUFFETT-GRADE ETL PIPELINE  v5.5
-Changes vs v5.4:
-  - quarterly_results and annual_results are now primary P&L tables
-    (replaced by Screener — not yfinance income_statement quarterly)
-  - Pre/post-insert validation via database.validator
-  - Post-load audit step logs completeness to data_quality_log
-  - cash_flow: best_* columns resolved (fix historical NULL problem)
-  - quarterly_cashflow_derived: quality_score + is_real enforced
-  - growth_metrics: scr_* NULLs diagnosed and flagged
-  - Source priority enforced: Screener > yfinance for Indian stocks
+BUFFETT-GRADE ETL PIPELINE  v5.7
+Changes vs v5.6:
+  • Added post-load reconciliation pass (etl/load/reconcile.py)
+    that fixes all 4 broken tables in one consolidated pass:
+      - balance_sheet    : backfills scr_* → canonical cols (2014–2025)
+      - cash_flow        : backfills operating/investing/fcf from scr_*
+      - income_statement : merges Screener scr_* + dep fallback
+      - growth_metrics   : fixes scr_growth_available + completeness
+      - fundamentals     : merges revenue/NI/EBITDA/FCF/ratios/EV
+  • Reconcile runs AFTER dedup so the canonical data is clean
+  • _safe_df() helper retained for DataFrame ambiguity safety
+  • All audits moved to end (after reconcile) so completeness
+    numbers reflect the fully merged state
 """
 
 import sys
@@ -18,8 +21,8 @@ from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from database.init_db  import init_db
-from database.dedup    import run_all_dedup
+from database.init_db   import init_db
+from database.dedup     import run_all_dedup
 from database.validator import audit_table
 
 from etl.extract.price              import fetch_price
@@ -51,6 +54,22 @@ from etl.load.growth_loader             import load_growth_metrics
 from etl.load.quarterly_cashflow_loader import load_quarterly_cashflow
 from etl.load.run_log_loader            import log_run
 from etl.load.screener_loader           import load_all_screener
+from etl.load.reconcile                 import run_reconciliation
+
+import pandas as pd
+
+
+def _safe_df(obj) -> pd.DataFrame | None:
+    """
+    Safely return a DataFrame only if non-None and non-empty.
+    Prevents: ValueError: The truth value of a DataFrame is ambiguous.
+    Never use `if df:` or `df or other` on pandas DataFrames.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, pd.DataFrame):
+        return obj if not obj.empty else None
+    return None
 
 
 def run_pipeline(symbol_yf: str = "ADANIPORTS.NS"):
@@ -59,7 +78,7 @@ def run_pipeline(symbol_yf: str = "ADANIPORTS.NS"):
     ok_mods, warn_mods = [], []
 
     print(f"\n{'='*60}")
-    print(f"  BUFFETT ETL PIPELINE  v5.5")
+    print(f"  BUFFETT ETL PIPELINE  v5.7")
     print(f"  Symbol : {symbol_nse}  ({symbol_yf})")
     print(f"  Date   : {today}")
     print(f"{'='*60}\n")
@@ -94,36 +113,64 @@ def run_pipeline(symbol_yf: str = "ADANIPORTS.NS"):
     except Exception as e:
         print(f"  error technicals: {e}"); warn_mods.append("technicals")
 
-    # ── 4. Fundamentals (yfinance) ─────────────────────────────
-    print(f"\n[4/11] Fundamentals (yfinance ratios/valuation)...")
+    # ── 4. Screener.in ─────────────────────────────────────────
+    # Runs BEFORE yfinance so Screener values take priority.
+    print(f"\n[4/11] Screener.in (primary financial data source)...")
+    screener_data = {}
+    try:
+        screener_data = fetch_screener_data(symbol_nse)
+        if not screener_data:
+            raise Exception("empty response from Screener.in")
+        load_all_screener(screener_data, symbol_nse)
+        ok_mods.append("screener")
+    except Exception as e:
+        print(f"  error screener: {e}"); warn_mods.append("screener")
+        import traceback; traceback.print_exc()
+
+    time.sleep(0.5)
+
+    # ── 5. Fundamentals (yfinance ratios/valuation) ────────────
+    print(f"\n[5/11] Fundamentals (yfinance ratios/valuation)...")
     try:
         fund_data = fetch_fundamentals(symbol_yf)
         load_fundamentals(symbol_nse, fund_data)
+
+        # Screener ratios on top (ROCE, OPM, WCD, DivPayout)
+        screener_ratios = screener_data.get("ratios") if screener_data else None
+        if screener_ratios is not None and isinstance(screener_ratios, pd.DataFrame) \
+                and not screener_ratios.empty:
+            from etl.load.screener_loader import load_fundamentals_from_screener
+            load_fundamentals_from_screener(screener_ratios, symbol_nse)
+
         ok_mods.append("fundamentals_yf")
     except Exception as e:
         print(f"  error fundamentals_yf: {e}"); warn_mods.append("fundamentals_yf")
 
     time.sleep(0.5)
 
-    # ── 5. yfinance statements (detailed line items) ───────────
-    print(f"\n[5/11] Financial statements (yfinance detailed)...")
+    # ── 6. yfinance statements (detailed line items) ───────────
+    print(f"\n[6/11] Financial statements (yfinance detailed)...")
     stmts = {}
     try:
         stmts = fetch_statements(symbol_yf)
-        load_income(stmts.get("annual_income"),  symbol_nse, "annual")
-        load_balance(stmts.get("annual_bs"),     symbol_nse, "annual", 0)
-        load_cashflow(stmts.get("annual_cf"),    symbol_nse, "annual")
 
-        q_inc = stmts.get("q_income")
-        if q_inc is not None and not q_inc.empty:
+        load_income(_safe_df(stmts.get("annual_income")),  symbol_nse, "annual")
+        load_balance(_safe_df(stmts.get("annual_bs")),     symbol_nse, "annual", 0)
+        load_cashflow(_safe_df(stmts.get("annual_cf")),    symbol_nse, "annual")
+
+        q_inc = _safe_df(stmts.get("q_income"))
+        if q_inc is not None:
             load_income(q_inc, symbol_nse, "quarterly")
 
-        q_bs = stmts.get("q_bs_extended") or stmts.get("q_bs")
-        if q_bs is not None and not q_bs.empty:
+        # _safe_df() prevents DataFrame truth-value ambiguity error
+        q_bs = _safe_df(stmts.get("q_bs_extended"))
+        if q_bs is None:
+            q_bs = _safe_df(stmts.get("q_bs"))
+        if q_bs is not None:
             load_balance(q_bs, symbol_nse, "quarterly", 0)
 
-        q_cf = stmts.get("q_cf")
-        if q_cf is not None and not q_cf.empty:
+        q_cf = _safe_df(stmts.get("q_cf"))
+        if q_cf is not None:
             load_cashflow(q_cf, symbol_nse, "quarterly")
 
         ok_mods.append("statements_yf")
@@ -132,28 +179,6 @@ def run_pipeline(symbol_yf: str = "ADANIPORTS.NS"):
         import traceback; traceback.print_exc()
 
     time.sleep(0.5)
-
-    # ── 6. Screener.in (PRIMARY source for Indian P&L data) ────
-    print(f"\n[6/11] Screener.in (primary financial data source)...")
-    screener_data = {}
-    try:
-        screener_data = fetch_screener_data(symbol_nse)
-        if not screener_data:
-            raise Exception("empty response from Screener.in")
-
-        load_all_screener(screener_data, symbol_nse)
-
-        # Post-load audit
-        for tbl in ["quarterly_results", "annual_results",
-                    "balance_sheet", "cash_flow", "growth_metrics"]:
-            audit_table(symbol_nse, tbl)
-
-        ok_mods.append("screener")
-    except Exception as e:
-        print(f"  error screener: {e}"); warn_mods.append("screener")
-        import traceback; traceback.print_exc()
-
-    time.sleep(0.3)
 
     # ── 7. Corporate actions ───────────────────────────────────
     print(f"\n[7/11] Corporate actions...")
@@ -189,7 +214,6 @@ def run_pipeline(symbol_yf: str = "ADANIPORTS.NS"):
         own_data = fetch_ownership(symbol_yf, symbol_nse,
                                    screener_shareholding_df=screener_sh)
         load_ownership(own_data, symbol_nse)
-        audit_table(symbol_nse, "ownership_history")
         ok_mods.append("ownership")
     except Exception as e:
         print(f"  error ownership: {e}"); warn_mods.append("ownership")
@@ -224,27 +248,21 @@ def run_pipeline(symbol_yf: str = "ADANIPORTS.NS"):
         print(f"  error growth_metrics_yf: {e}"); warn_mods.append("growth_metrics_yf")
 
     try:
-        q_inc    = stmts.get("q_income")      if stmts else None
-        q_bs_ext = stmts.get("q_bs_extended") if stmts else None
-        q_bs_raw = stmts.get("q_bs")          if stmts else None
+        q_inc_raw = stmts.get("q_income")      if stmts else None
+        q_bs_ext  = stmts.get("q_bs_extended") if stmts else None
+        q_bs_raw  = stmts.get("q_bs")          if stmts else None
 
         qcf_records = fetch_quarterly_cashflow(
             symbol_yf,
-            q_inc=q_inc,
-            q_bs_extended=q_bs_ext,
-            bs_audit=stmts.get("bs_audit", {}),
-            q_bs_real=q_bs_raw,
+            q_inc=_safe_df(q_inc_raw),
+            q_bs_extended=_safe_df(q_bs_ext),
+            bs_audit=stmts.get("bs_audit", {}) if stmts else {},
+            q_bs_real=_safe_df(q_bs_raw),
         )
-        # Loader enforces quality_score >= 2; is_interpolated=0 always
         load_quarterly_cashflow(qcf_records, symbol_nse)
-        audit_table(symbol_nse, "quarterly_cashflow_derived")
         ok_mods.append("quarterly_cashflow")
     except Exception as e:
         print(f"  error quarterly_cashflow: {e}"); warn_mods.append("quarterly_cashflow")
-
-    # Final audit on fundamentals and growth
-    audit_table(symbol_nse, "fundamentals")
-    audit_table(symbol_nse, "growth_metrics")
 
     # ── Dedup ──────────────────────────────────────────────────
     print(f"\n[DEDUP]...")
@@ -253,6 +271,27 @@ def run_pipeline(symbol_yf: str = "ADANIPORTS.NS"):
         print("  dedup complete")
     except Exception as e:
         print(f"  dedup error: {e}")
+
+    # ── Reconciliation ─────────────────────────────────────────
+    # Must run AFTER dedup. Fixes the 4 broken tables:
+    #   balance_sheet, cash_flow, income_statement,
+    #   growth_metrics, fundamentals
+    try:
+        run_reconciliation(symbol_nse)
+        ok_mods.append("reconcile")
+    except Exception as e:
+        print(f"  error reconcile: {e}"); warn_mods.append("reconcile")
+        import traceback; traceback.print_exc()
+
+    # ── Final audits (after reconcile so numbers are accurate) ─
+    print(f"\n[AUDIT]")
+    for tbl in [
+        "fundamentals", "growth_metrics",
+        "quarterly_results", "annual_results",
+        "income_statement", "balance_sheet",
+        "cash_flow", "quarterly_cashflow_derived",
+    ]:
+        audit_table(symbol_nse, tbl)
 
     log_run(symbol_nse, ok_mods, warn_mods)
 
