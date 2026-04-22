@@ -1,17 +1,35 @@
+# ── pipeline.py DIFF — two changes only ──────────────────────────────────────
+#
+# 1. ADD this import alongside the other balance_loader import (line ~28):
+#
+#    from etl.load.balance_loader import load_balance, backfill_balance_canonical
+#
+#    (replace the existing `from etl.load.balance_loader import load_balance` line)
+#
+#
+# 2. ADD one call right after the DEDUP block and BEFORE run_reconciliation:
+#
+#    # ── Balance canonical backfill ──────────────────────────────────────────
+#    # Fills canonical cols (total_assets, total_equity, etc.) from scr_* for
+#    # any row where yfinance had no data (pre-2022 annual rows).
+#    # Safe to run multiple times — COALESCE prevents overwriting real data.
+#    try:
+#        backfill_balance_canonical(symbol_nse)
+#    except Exception as e:
+#        print(f"  error balance_backfill: {e}")
+#
+#
+# That's it. No other files touched.
+# ─────────────────────────────────────────────────────────────────────────────
+
 """
-BUFFETT-GRADE ETL PIPELINE  v5.7
-Changes vs v5.6:
-  • Added post-load reconciliation pass (etl/load/reconcile.py)
-    that fixes all 4 broken tables in one consolidated pass:
-      - balance_sheet    : backfills scr_* → canonical cols (2014–2025)
-      - cash_flow        : backfills operating/investing/fcf from scr_*
-      - income_statement : merges Screener scr_* + dep fallback
-      - growth_metrics   : fixes scr_growth_available + completeness
-      - fundamentals     : merges revenue/NI/EBITDA/FCF/ratios/EV
-  • Reconcile runs AFTER dedup so the canonical data is clean
-  • _safe_df() helper retained for DataFrame ambiguity safety
-  • All audits moved to end (after reconcile) so completeness
-    numbers reflect the fully merged state
+BUFFETT-GRADE ETL PIPELINE  v5.8
+Changes vs v5.7:
+  • balance_loader.py v4.1: load_balance_from_screener() now also writes
+    canonical columns derived from Screener fields so pre-2022 annual rows
+    are no longer NULL in total_assets / total_equity / total_debt / net_ppe.
+  • Added backfill_balance_canonical(symbol) call after dedup as a safety net
+    for any rows still missing canonical data.
 """
 
 import sys
@@ -42,7 +60,7 @@ from etl.load.price_loader              import load_price
 from etl.load.technical_loader          import load_technicals
 from etl.load.fundamentals_loader       import load_fundamentals
 from etl.load.income_loader             import load_income
-from etl.load.balance_loader            import load_balance
+from etl.load.balance_loader            import load_balance, backfill_balance_canonical   # ← v4.1
 from etl.load.cashflow_loader           import load_cashflow
 from etl.load.corporate_actions_loader  import load_corporate_actions
 from etl.load.macro_loader              import (load_market_indices, load_forex_commodities,
@@ -78,7 +96,7 @@ def run_pipeline(symbol_yf: str = "ADANIPORTS.NS"):
     ok_mods, warn_mods = [], []
 
     print(f"\n{'='*60}")
-    print(f"  BUFFETT ETL PIPELINE  v5.7")
+    print(f"  BUFFETT ETL PIPELINE  v5.8")
     print(f"  Symbol : {symbol_nse}  ({symbol_yf})")
     print(f"  Date   : {today}")
     print(f"{'='*60}\n")
@@ -271,6 +289,17 @@ def run_pipeline(symbol_yf: str = "ADANIPORTS.NS"):
         print("  dedup complete")
     except Exception as e:
         print(f"  dedup error: {e}")
+
+    # ── Balance canonical backfill ─────────────────────────────
+    # Fills canonical cols (total_assets, total_equity, total_debt,
+    # net_ppe, etc.) from scr_* for rows where yfinance had no data
+    # (pre-2022 annual rows and any gaps). COALESCE-guarded so real
+    # yfinance values are never overwritten.
+    try:
+        backfill_balance_canonical(symbol_nse)
+        ok_mods.append("balance_backfill")
+    except Exception as e:
+        print(f"  error balance_backfill: {e}"); warn_mods.append("balance_backfill")
 
     # ── Reconciliation ─────────────────────────────────────────
     # Must run AFTER dedup. Fixes the 4 broken tables:
