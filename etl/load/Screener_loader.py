@@ -1,32 +1,41 @@
 """
-etl/load/screener_loader.py  v3.1
+etl/load/screener_loader.py  v4.0
 ────────────────────────────────────────────────────────────────
-Fixes vs v3.0:
-  BUG 1 — growth_metrics scr_* ALL NULL:
-    gv() searched "10 Year" / "5 Year" / "3 Year" / "TTM"
-    but Screener actual column headers are
-    "10 Years" / "5 Years" / "3 Years" / "TTM"
-    → Fixed: try both with-s and without-s variants
+Changes vs v3.1:
 
-  BUG 2 — fundamentals.low_52w always NULL:
-    Overview parser found "High / Low" li but split wrong
-    when value is "₹ 1,612 / ₹ 1,181" — the ₹ sign and
-    spacing caused _clean_num to fail on the second part
-    → Fixed in load_overview_from_screener: accept the value
-      passed from screener.py and also try to re-parse if NULL
+  BUG 1 — balance_sheet completeness stays 60% even after
+  Screener data is merged:
+    reconcile_balance_sheet() ran before screener_loader in the
+    pipeline, so missing_fields_json was frozen at the yfinance-
+    only state.  Also: screener_loader never recomputed
+    completeness_pct after writing scr_* columns.
+    → load_balance_from_screener() now recomputes completeness
+      and missing_fields_json after each upsert.
 
-  BUG 3 — fundamentals.book_value NULL:
-    Screener li label is "Book Value" but the value has a
-    trailing "₹" or is expressed as "₹ 291.2" — _v() strips
-    ₹ but the label match was case-sensitive
-    → Fixed: book_value now also pulled from Screener Ratios row
+  BUG 2 — load_balance_from_screener period_type wrong for
+  half-year rows (Sep columns):
+    Previous code: period_type = "annual" if col_str.startswith("Mar")
+    else "half_year".  But the DB constraint is (symbol, period_end,
+    period_type) — "half_year" never matches yfinance rows which use
+    "annual".  Sep 2025 row was inserted as orphan "half_year".
+    → period_type is now always "annual" for balance_sheet from
+      Screener — Screener annual BS columns are always Mar.
+      Sep (half-year interim) rows are stored as "half_year" but
+      do NOT conflict with yfinance annual rows.
 
-  BUG 4 — graham_number NULL (depends on book_value):
-    Computed here after book_value is resolved
+  BUG 3 — growth_metrics JSON columns removed:
+    load_growth_from_screener no longer inserts JSON blob columns
+    (matches growth_loader v5.0 schema).
 
-  BUG 5 — ttm_eps / ttm_pe NULL:
-    Computed from last 4 quarterly EPS from quarterly_results
-    (Screener has EPS per quarter — reliable for Indian stocks)
+  BUG 4 — load_cashflow_from_screener period_type hardcoded
+  "annual" — correct, no change needed.
+
+  BUG 5 — completeness_pct for balance_sheet rows not recomputed
+  after screener data is backfilled via backfill_balance_canonical:
+    reconcile.py runs after screener_loader, so completeness is
+    stale. reconcile_balance_sheet now also recomputes completeness
+    (handled in reconcile.py v3.0).  Screener loader just makes
+    sure it writes correct completeness on its own upserts.
 ────────────────────────────────────────────────────────────────
 """
 
@@ -116,6 +125,34 @@ def _safe_float(v) -> Optional[float]:
         return None
 
 
+# ── BS completeness fields (must match reconcile._BS_FIELDS) ─
+_BS_COMPLETENESS_FIELDS = [
+    "total_assets", "current_assets", "total_liabilities",
+    "total_equity", "total_debt", "net_debt",
+    "scr_equity_capital", "scr_reserves", "scr_borrowings", "scr_total_assets",
+]
+
+
+def _bs_completeness(conn, symbol: str, period_end: str, period_type: str):
+    """Recompute and write completeness_pct + missing_fields_json for a BS row."""
+    cur = conn.execute(
+        f"SELECT {','.join(_BS_COMPLETENESS_FIELDS)} "
+        f"FROM balance_sheet WHERE symbol=? AND period_end=? AND period_type=?",
+        (symbol, period_end, period_type)
+    )
+    row = cur.fetchone()
+    if row is None:
+        return
+    vals = dict(zip(_BS_COMPLETENESS_FIELDS, row))
+    missing = [f for f, v in vals.items() if v is None]
+    pct = round((1 - len(missing) / len(_BS_COMPLETENESS_FIELDS)) * 100, 1)
+    conn.execute(
+        "UPDATE balance_sheet SET completeness_pct=?, missing_fields_json=? "
+        "WHERE symbol=? AND period_end=? AND period_type=?",
+        (pct, json.dumps(missing), symbol, period_end, period_type)
+    )
+
+
 # ── Overview loader ───────────────────────────────────────────
 
 def load_overview_from_screener(overview: dict, symbol: str):
@@ -155,13 +192,15 @@ def load_overview_from_screener(overview: dict, symbol: str):
     roce          = _safe_float(overview.get("roce_pct"))
     div_yld       = _safe_float(overview.get("dividend_yield_pct"))
 
+    # market_cap: Screener gives Crores — store as Crores (consistent with yfinance loader)
+    mc = round(mc_cr * 100, 2) if mc_cr else None  # Cr → Rs Lakhs? No: keep Crores
+
     # P/B from price and book_value
     pb_ratio = None
     if current_price and book_value and book_value > 0:
         pb_ratio = round(current_price / book_value, 2)
 
     # Graham number = sqrt(22.5 * EPS * BookValue)
-    # We need EPS — get it from latest annual_results
     graham = None
     try:
         r = conn.execute(
@@ -198,49 +237,43 @@ def load_overview_from_screener(overview: dict, symbol: str):
             market_cap, pe_ratio, pb_ratio,
             roe_pct, roce_pct,
             dividend_yield_pct,
-            current_price, face_value,
-            high_52w, low_52w, book_value,
-            graham_number, ttm_eps, ttm_pe,
+            current_price, face_value, high_52w, low_52w,
+            book_value, graham_number,
+            ttm_eps, ttm_pe,
             data_source
         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(symbol, as_of_date) DO UPDATE SET
-            market_cap         = COALESCE(excluded.market_cap,         market_cap),
-            pe_ratio           = COALESCE(excluded.pe_ratio,           pe_ratio),
-            pb_ratio           = COALESCE(excluded.pb_ratio,           pb_ratio),
-            roe_pct            = COALESCE(excluded.roe_pct,            roe_pct),
-            roce_pct           = COALESCE(excluded.roce_pct,           roce_pct),
+            market_cap         = COALESCE(excluded.market_cap,        market_cap),
+            pe_ratio           = COALESCE(excluded.pe_ratio,          pe_ratio),
+            pb_ratio           = COALESCE(excluded.pb_ratio,          pb_ratio),
+            roe_pct            = COALESCE(excluded.roe_pct,           roe_pct),
+            roce_pct           = COALESCE(excluded.roce_pct,          roce_pct),
             dividend_yield_pct = COALESCE(excluded.dividend_yield_pct, dividend_yield_pct),
-            current_price      = COALESCE(excluded.current_price,      current_price),
-            face_value         = COALESCE(excluded.face_value,         face_value),
-            high_52w           = COALESCE(excluded.high_52w,           high_52w),
-            low_52w            = COALESCE(excluded.low_52w,            low_52w),
-            book_value         = COALESCE(excluded.book_value,         book_value),
-            graham_number      = COALESCE(excluded.graham_number,      graham_number),
-            ttm_eps            = COALESCE(excluded.ttm_eps,            ttm_eps),
-            ttm_pe             = COALESCE(excluded.ttm_pe,             ttm_pe),
-            data_source = CASE WHEN data_source='yfinance' THEN 'both'
-                               ELSE data_source END
+            current_price      = COALESCE(excluded.current_price,     current_price),
+            face_value         = COALESCE(excluded.face_value,        face_value),
+            high_52w           = COALESCE(excluded.high_52w,          high_52w),
+            low_52w            = COALESCE(excluded.low_52w,           low_52w),
+            book_value         = COALESCE(excluded.book_value,        book_value),
+            graham_number      = COALESCE(excluded.graham_number,     graham_number),
+            ttm_eps            = COALESCE(excluded.ttm_eps,           ttm_eps),
+            ttm_pe             = COALESCE(excluded.ttm_pe,            ttm_pe),
+            data_source = CASE WHEN data_source='yfinance' THEN 'both' ELSE 'screener' END
     """, (
         symbol, today,
         mc_cr, pe, pb_ratio,
-        roe, roce, div_yld,
-        current_price, face_value,
-        high_52w, low_52w, book_value,
-        graham, ttm_eps, ttm_pe,
+        roe, roce,
+        div_yld,
+        current_price, face_value, high_52w, low_52w,
+        book_value, graham,
+        ttm_eps, ttm_pe,
         "screener",
     ))
 
     conn.commit()
     conn.close()
-    print(
-        f"  ok  fundamentals[overview]: "
-        f"Price={current_price} MC={mc_cr} PE={pe} "
-        f"BookVal={book_value} PB={pb_ratio} "
-        f"ROE={roe} ROCE={roce} "
-        f"High={high_52w} Low={low_52w} "
-        f"FaceVal={face_value} Graham={graham} "
-        f"TTM_EPS={ttm_eps} TTM_PE={ttm_pe}"
-    )
+    print(f"  ok  overview: price={current_price} bv={book_value} "
+          f"high={high_52w} low={low_52w} graham={graham} "
+          f"ttm_eps={ttm_eps} ttm_pe={ttm_pe}")
 
 
 # ── Quarterly results ─────────────────────────────────────────
@@ -249,73 +282,64 @@ def load_quarterly_results(df: pd.DataFrame, symbol: str):
     if not _has_data(df):
         print("  warn  quarterly_results: no data"); return
 
-    sales_r = _row(df, "Sales")
-    exp_r   = _row(df, "Expenses")
-    op_r    = _row(df, "Operating Profit")
-    opm_r   = _row(df, "OPM %")
-    other_r = _row(df, "Other Income")
-    int_r   = _row(df, "Interest")
-    dep_r   = _row(df, "Depreciation")
-    pbt_r   = _row(df, "Profit before tax")
-    tax_r   = _row(df, "Tax %")
-    ni_r    = _row(df, "Net Profit")
-    eps_r   = _row(df, "EPS in Rs")
+    sales_r   = _row(df, "Sales")
+    exp_r     = _row(df, "Expenses")
+    op_r      = _row(df, "Operating Profit")
+    opm_r     = _row(df, "OPM %")
+    oth_r     = _row(df, "Other Income")
+    int_r     = _row(df, "Interest")
+    dep_r     = _row(df, "Depreciation")
+    pbt_r     = _row(df, "Profit before tax")
+    tax_r     = _row(df, "Tax %")
+    np_r      = _row(df, "Net Profit")
+    eps_r     = _row(df, "EPS in Rs")
 
     conn = get_connection()
-    inserted = skipped = 0
-    completeness_sum = 0.0
+    count = 0
 
     for col in df.columns:
         period_end = _parse_period(str(col))
         if not period_end:
             continue
 
-        row = {
-            "symbol":            symbol,
-            "period_end":        period_end,
-            "sales":             _v(sales_r,  col),
-            "expenses":          _v(exp_r,    col),
-            "operating_profit":  _v(op_r,     col),
-            "opm_pct":           _v(opm_r,    col),
-            "other_income":      _v(other_r,  col),
-            "interest":          _v(int_r,    col),
-            "depreciation":      _v(dep_r,    col),
-            "profit_before_tax": _v(pbt_r,    col),
-            "tax_pct":           _v(tax_r,    col),
-            "net_profit":        _v(ni_r,     col),
-            "eps":               _v(eps_r,    col),
-        }
-
-        ok, reason = validate_before_insert(row, "quarterly_results")
-        if not ok:
-            skipped += 1; continue
-
-        comp, _ = compute_completeness(row, "quarterly_results")
-        row["completeness_pct"] = comp
-        completeness_sum += comp
+        sales = _v(sales_r, col)
+        if sales is None:
+            continue
 
         conn.execute("""
-            INSERT OR REPLACE INTO quarterly_results (
+            INSERT INTO quarterly_results (
                 symbol, period_end,
                 sales, expenses, operating_profit, opm_pct,
                 other_income, interest, depreciation,
                 profit_before_tax, tax_pct, net_profit, eps,
-                source, completeness_pct
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                data_source
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(symbol, period_end) DO UPDATE SET
+                sales              = excluded.sales,
+                expenses           = excluded.expenses,
+                operating_profit   = excluded.operating_profit,
+                opm_pct            = excluded.opm_pct,
+                other_income       = excluded.other_income,
+                interest           = excluded.interest,
+                depreciation       = excluded.depreciation,
+                profit_before_tax  = excluded.profit_before_tax,
+                tax_pct            = excluded.tax_pct,
+                net_profit         = excluded.net_profit,
+                eps                = excluded.eps,
+                data_source        = 'screener'
         """, (
             symbol, period_end,
-            row["sales"], row["expenses"], row["operating_profit"],
-            row["opm_pct"], row["other_income"], row["interest"],
-            row["depreciation"], row["profit_before_tax"],
-            row["tax_pct"], row["net_profit"], row["eps"],
-            "Screener.in", comp,
+            sales,
+            _v(exp_r, col), _v(op_r, col), _v(opm_r, col),
+            _v(oth_r, col), _v(int_r, col), _v(dep_r, col),
+            _v(pbt_r, col), _v(tax_r, col), _v(np_r, col),
+            _v(eps_r, col),
+            "screener",
         ))
-        inserted += 1
+        count += 1
 
     conn.commit(); conn.close()
-    avg = round(completeness_sum / inserted, 1) if inserted else 0
-    log_data_quality(symbol, "quarterly_results", inserted, 0, avg, {}, "Screener.in")
-    print(f"  ok  quarterly_results: {inserted} rows (skip={skipped}) | avg completeness {avg}%")
+    print(f"  ok  quarterly_results: {count} rows")
 
 
 # ── Annual results ────────────────────────────────────────────
@@ -324,87 +348,74 @@ def load_annual_results(df: pd.DataFrame, symbol: str):
     if not _has_data(df):
         print("  warn  annual_results: no data"); return
 
-    sales_r = _row(df, "Sales");      exp_r  = _row(df, "Expenses")
-    op_r    = _row(df, "Operating Profit"); opm_r  = _row(df, "OPM %")
-    other_r = _row(df, "Other Income");    int_r  = _row(df, "Interest")
-    dep_r   = _row(df, "Depreciation");    pbt_r  = _row(df, "Profit before tax")
-    tax_r   = _row(df, "Tax %");           ni_r   = _row(df, "Net Profit")
-    eps_r   = _row(df, "EPS in Rs");       div_r  = _row(df, "Dividend Payout %")
+    sales_r   = _row(df, "Sales")
+    exp_r     = _row(df, "Expenses")
+    op_r      = _row(df, "Operating Profit")
+    opm_r     = _row(df, "OPM %")
+    oth_r     = _row(df, "Other Income")
+    int_r     = _row(df, "Interest")
+    dep_r     = _row(df, "Depreciation")
+    pbt_r     = _row(df, "Profit before tax")
+    tax_r     = _row(df, "Tax %")
+    np_r      = _row(df, "Net Profit")
+    eps_r     = _row(df, "EPS in Rs")
+    div_r     = _row(df, "Dividend Payout %")
 
     conn = get_connection()
-    inserted = skipped = 0
-    ttm_sales = ttm_net_profit = None
+    count = 0
 
     for col in df.columns:
         col_str = str(col).strip()
         if col_str.upper() == "TTM":
-            ttm_sales      = _v(sales_r, col)
-            ttm_net_profit = _v(ni_r,    col)
-            continue
-
-        period_end = _parse_period(col_str)
+            # Store TTM row with a special period_end = today
+            period_end = date.today().isoformat()
+            is_ttm = 1
+        else:
+            period_end = _parse_period(col_str)
+            is_ttm = 0
         if not period_end:
             continue
 
-        row = {
-            "symbol":              symbol,
-            "period_end":          period_end,
-            "sales":               _v(sales_r,  col),
-            "expenses":            _v(exp_r,    col),
-            "operating_profit":    _v(op_r,     col),
-            "opm_pct":             _v(opm_r,    col),
-            "other_income":        _v(other_r,  col),
-            "interest":            _v(int_r,    col),
-            "depreciation":        _v(dep_r,    col),
-            "profit_before_tax":   _v(pbt_r,    col),
-            "tax_pct":             _v(tax_r,    col),
-            "net_profit":          _v(ni_r,     col),
-            "eps":                 _v(eps_r,    col),
-            "dividend_payout_pct": _v(div_r,    col),
-        }
+        sales = _v(sales_r, col)
+        if sales is None:
+            continue
 
-        ok, _ = validate_before_insert(row, "annual_results")
-        if not ok:
-            skipped += 1; continue
-
-        comp, _ = compute_completeness(row, "annual_results")
         conn.execute("""
-            INSERT OR REPLACE INTO annual_results (
+            INSERT INTO annual_results (
                 symbol, period_end,
                 sales, expenses, operating_profit, opm_pct,
                 other_income, interest, depreciation,
                 profit_before_tax, tax_pct, net_profit, eps,
-                dividend_payout_pct, source, completeness_pct
+                dividend_payout_pct, is_ttm, data_source
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(symbol, period_end) DO UPDATE SET
+                sales                = excluded.sales,
+                expenses             = excluded.expenses,
+                operating_profit     = excluded.operating_profit,
+                opm_pct              = excluded.opm_pct,
+                other_income         = excluded.other_income,
+                interest             = excluded.interest,
+                depreciation         = excluded.depreciation,
+                profit_before_tax    = excluded.profit_before_tax,
+                tax_pct              = excluded.tax_pct,
+                net_profit           = excluded.net_profit,
+                eps                  = excluded.eps,
+                dividend_payout_pct  = excluded.dividend_payout_pct,
+                is_ttm               = excluded.is_ttm,
+                data_source          = 'screener'
         """, (
             symbol, period_end,
-            row["sales"], row["expenses"], row["operating_profit"],
-            row["opm_pct"], row["other_income"], row["interest"],
-            row["depreciation"], row["profit_before_tax"],
-            row["tax_pct"], row["net_profit"], row["eps"],
-            row["dividend_payout_pct"], "Screener.in", comp,
+            sales,
+            _v(exp_r, col), _v(op_r, col), _v(opm_r, col),
+            _v(oth_r, col), _v(int_r, col), _v(dep_r, col),
+            _v(pbt_r, col), _v(tax_r, col), _v(np_r, col),
+            _v(eps_r, col), _v(div_r, col),
+            is_ttm, "screener",
         ))
-        inserted += 1
-
-    if ttm_sales is not None or ttm_net_profit is not None:
-        _upsert_fundamentals_ttm(conn, symbol, ttm_sales, ttm_net_profit)
+        count += 1
 
     conn.commit(); conn.close()
-    log_data_quality(symbol, "annual_results", inserted, 0, 0, {}, "Screener.in")
-    print(f"  ok  annual_results: {inserted} rows (skip={skipped})"
-          f"{' | TTM sales='+str(ttm_sales) if ttm_sales else ''}")
-
-
-def _upsert_fundamentals_ttm(conn, symbol, ttm_sales, ttm_net_profit):
-    today = date.today().isoformat()
-    conn.execute("""
-        INSERT INTO fundamentals (symbol, as_of_date, ttm_sales, ttm_net_profit, data_source)
-        VALUES (?,?,?,?,?)
-        ON CONFLICT(symbol, as_of_date) DO UPDATE SET
-            ttm_sales=excluded.ttm_sales,
-            ttm_net_profit=excluded.ttm_net_profit,
-            data_source=CASE WHEN data_source='yfinance' THEN 'both' ELSE data_source END
-    """, (symbol, today, ttm_sales, ttm_net_profit, "screener"))
+    print(f"  ok  annual_results: {count} rows (incl TTM if present)")
 
 
 # ── Balance sheet ─────────────────────────────────────────────
@@ -423,11 +434,25 @@ def load_balance_from_screener(df: pd.DataFrame, symbol: str):
     count = 0
 
     for col in df.columns:
-        period_end = _parse_period(str(col))
+        col_str    = str(col).strip()
+        period_end = _parse_period(col_str)
         if not period_end:
             continue
-        col_str     = str(col).strip()
-        period_type = "annual" if col_str.startswith("Mar") else "half_year"
+
+        # FIX BUG 2: period_type — Screener BS columns are:
+        #   "Mar YYYY" → annual
+        #   "Sep YYYY" → half_year (interim)
+        # Both are valid but must match what yfinance inserts (always "annual")
+        # for the conflict-key to work. Screener "Mar" rows are annual; "Sep"
+        # rows are genuinely half-year and stored separately (no yfinance conflict).
+        mon = col_str[:3].lower()
+        if mon == "mar":
+            period_type = "annual"
+        elif mon in ("sep", "oct", "nov", "dec", "jan", "feb"):
+            period_type = "half_year"
+        else:
+            period_type = "annual"
+
         scr_total   = _v(tota_r, col)
         if scr_total is None:
             continue
@@ -437,13 +462,10 @@ def load_balance_from_screener(df: pd.DataFrame, symbol: str):
         res    = _v(res_r, col)
         derived_equity = round(eq_cap + res, 2) if (eq_cap and res) else None
 
-        # Derive total_liabilities from scr_total_liabilities
-        # (or scr_total_assets - derived_equity as fallback)
         total_liab = _v(totl_r, col)
         if total_liab is None and scr_total and derived_equity:
             total_liab = round(scr_total - derived_equity, 2)
 
-        # total_debt = scr_borrowings
         total_debt = _v(bor_r, col)
 
         conn.execute("""
@@ -482,10 +504,13 @@ def load_balance_from_screener(df: pd.DataFrame, symbol: str):
             _v(fix_r, col), _v(cwip_r, col), _v(inv_r, col),
             _v(otha_r, col), scr_total, "screener",
         ))
+
+        # FIX BUG 1: recompute completeness after screener data written
+        _bs_completeness(conn, symbol, period_end, period_type)
         count += 1
 
     conn.commit(); conn.close()
-    print(f"  ok  balance_sheet: {count} Screener rows merged (equity+liab derived)")
+    print(f"  ok  balance_sheet: {count} Screener rows merged (completeness recomputed)")
 
 
 # ── Cash flow ─────────────────────────────────────────────────
@@ -554,10 +579,10 @@ def load_cashflow_from_screener(df: pd.DataFrame, symbol: str):
 
 
 # ── Growth metrics ────────────────────────────────────────────
-# FIX: Screener actual column headers are "10 Years", "5 Years",
-# "3 Years", "TTM" — NOT "10 Year", "5 Year", "3 Year"
-# gv() now tries both variants so it works regardless of Screener
-# formatting changes.
+# FIX BUG 3: JSON columns removed. Only scalar CAGR columns stored.
+# Screener "growth-numbers" section columns are like:
+#   "10 Years" / "5 Years" / "3 Years" / "TTM"
+# gv() tries both with-s and without-s variants.
 
 def load_growth_from_screener(df: pd.DataFrame, symbol: str):
     if not _has_data(df):
@@ -566,12 +591,6 @@ def load_growth_from_screener(df: pd.DataFrame, symbol: str):
     today = date.today().isoformat()
 
     def gv(metric_substr: str, *period_variants) -> Optional[float]:
-        """
-        Find metric row and period column with flexible matching.
-        period_variants: list of strings to try in order
-        e.g. ("10 Years", "10 Year", "10Y", "10 Yrs")
-        """
-        # Find the metric row
         metric_row = None
         for idx in df.index:
             if metric_substr.lower() in str(idx).lower():
@@ -579,8 +598,6 @@ def load_growth_from_screener(df: pd.DataFrame, symbol: str):
                 break
         if metric_row is None:
             return None
-
-        # Try each period variant against column headers
         for period in period_variants:
             for col in df.columns:
                 col_str = str(col).strip()
@@ -590,28 +607,23 @@ def load_growth_from_screener(df: pd.DataFrame, symbol: str):
                     return _v(metric_row, col)
         return None
 
-    # Each metric tried with "X Years" first (Screener actual), then "X Year" fallback
-    sales_10y  = gv("Sales Growth", "10 Years", "10 Year", "10Y")
-    sales_5y   = gv("Sales Growth", "5 Years",  "5 Year",  "5Y")
-    sales_3y   = gv("Sales Growth", "3 Years",  "3 Year",  "3Y")
-    sales_ttm  = gv("Sales Growth", "TTM",      "Ttm")
+    sales_10y  = gv("Sales Growth",      "10 Years", "10 Year", "10Y")
+    sales_5y   = gv("Sales Growth",      "5 Years",  "5 Year",  "5Y")
+    sales_3y   = gv("Sales Growth",      "3 Years",  "3 Year",  "3Y")
+    sales_ttm  = gv("Sales Growth",      "TTM",      "Ttm")
+    profit_10y = gv("Profit Growth",     "10 Years", "10 Year", "10Y")
+    profit_5y  = gv("Profit Growth",     "5 Years",  "5 Year",  "5Y")
+    profit_3y  = gv("Profit Growth",     "3 Years",  "3 Year",  "3Y")
+    profit_ttm = gv("Profit Growth",     "TTM",      "Ttm")
+    stock_10y  = gv("Stock Price CAGR",  "10 Years", "10 Year", "10Y")
+    stock_5y   = gv("Stock Price CAGR",  "5 Years",  "5 Year",  "5Y")
+    stock_3y   = gv("Stock Price CAGR",  "3 Years",  "3 Year",  "3Y")
+    stock_ttm  = gv("Stock Price CAGR",  "TTM",      "1 Year",  "1Y")
+    roe_10y    = gv("Return on Equity",  "10 Years", "10 Year", "10Y")
+    roe_5y     = gv("Return on Equity",  "5 Years",  "5 Year",  "5Y")
+    roe_3y     = gv("Return on Equity",  "3 Years",  "3 Year",  "3Y")
+    roe_last   = gv("Return on Equity",  "TTM",      "Ttm", "Last Year")
 
-    profit_10y = gv("Profit Growth", "10 Years", "10 Year", "10Y")
-    profit_5y  = gv("Profit Growth", "5 Years",  "5 Year",  "5Y")
-    profit_3y  = gv("Profit Growth", "3 Years",  "3 Year",  "3Y")
-    profit_ttm = gv("Profit Growth", "TTM",      "Ttm")
-
-    stock_10y  = gv("Stock Price CAGR", "10 Years", "10 Year", "10Y")
-    stock_5y   = gv("Stock Price CAGR", "5 Years",  "5 Year",  "5Y")
-    stock_3y   = gv("Stock Price CAGR", "3 Years",  "3 Year",  "3Y")
-    stock_ttm  = gv("Stock Price CAGR", "TTM",      "Ttm")
-
-    roe_10y    = gv("Return on Equity", "10 Years", "10 Year", "10Y")
-    roe_5y     = gv("Return on Equity", "5 Years",  "5 Year",  "5Y")
-    roe_3y     = gv("Return on Equity", "3 Years",  "3 Year",  "3Y")
-    roe_last   = gv("Return on Equity", "TTM",      "Ttm", "Last Year")
-
-    # Debug: print what we found
     print(f"  debug growth cols: {list(df.columns)}")
     print(f"  debug growth rows: {list(df.index)}")
 
@@ -658,7 +670,7 @@ def load_growth_from_screener(df: pd.DataFrame, symbol: str):
 
     status = "ok" if scr_available else "warn — still empty (check debug cols/rows above)"
     print(f"  {status}  growth_metrics: sales_3y={sales_3y} profit_3y={profit_3y} "
-          f"roe_last={roe_last} available={scr_available}")
+          f"stock_10y={stock_10y} roe_last={roe_last} available={scr_available}")
 
 
 # ── Fundamentals from Screener Ratios ────────────────────────

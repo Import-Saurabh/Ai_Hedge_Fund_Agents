@@ -109,6 +109,7 @@ def reconcile_balance_sheet(symbol: str, conn):
     rows = conn.execute("""
         SELECT rowid, period_end, period_type,
                total_assets, current_assets, current_liabilities,
+               total_liabilities,
                total_equity, stockholders_equity,
                total_debt, net_debt,
                cash_and_equivalents, cash_equivalents, working_capital,
@@ -120,6 +121,7 @@ def reconcile_balance_sheet(symbol: str, conn):
     cols = [
         "rowid","period_end","period_type",
         "total_assets","current_assets","current_liabilities",
+        "total_liabilities",
         "total_equity","stockholders_equity",
         "total_debt","net_debt",
         "cash_and_equivalents","cash_equivalents","working_capital",
