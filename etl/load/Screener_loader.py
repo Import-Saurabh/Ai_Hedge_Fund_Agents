@@ -1,41 +1,26 @@
 """
-etl/load/screener_loader.py  v4.0
+etl/load/screener_loader.py  v5.0
 ────────────────────────────────────────────────────────────────
-Changes vs v3.1:
+Changes vs v4.0:
 
-  BUG 1 — balance_sheet completeness stays 60% even after
-  Screener data is merged:
-    reconcile_balance_sheet() ran before screener_loader in the
-    pipeline, so missing_fields_json was frozen at the yfinance-
-    only state.  Also: screener_loader never recomputed
-    completeness_pct after writing scr_* columns.
-    → load_balance_from_screener() now recomputes completeness
-      and missing_fields_json after each upsert.
-
-  BUG 2 — load_balance_from_screener period_type wrong for
-  half-year rows (Sep columns):
-    Previous code: period_type = "annual" if col_str.startswith("Mar")
-    else "half_year".  But the DB constraint is (symbol, period_end,
-    period_type) — "half_year" never matches yfinance rows which use
-    "annual".  Sep 2025 row was inserted as orphan "half_year".
-    → period_type is now always "annual" for balance_sheet from
-      Screener — Screener annual BS columns are always Mar.
-      Sep (half-year interim) rows are stored as "half_year" but
-      do NOT conflict with yfinance annual rows.
-
-  BUG 3 — growth_metrics JSON columns removed:
-    load_growth_from_screener no longer inserts JSON blob columns
-    (matches growth_loader v5.0 schema).
-
-  BUG 4 — load_cashflow_from_screener period_type hardcoded
-  "annual" — correct, no change needed.
-
-  BUG 5 — completeness_pct for balance_sheet rows not recomputed
-  after screener data is backfilled via backfill_balance_canonical:
-    reconcile.py runs after screener_loader, so completeness is
-    stale. reconcile_balance_sheet now also recomputes completeness
-    (handled in reconcile.py v3.0).  Screener loader just makes
-    sure it writes correct completeness on its own upserts.
+  SCHEMA REFORM — balance_sheet fully normalized:
+    • All yfinance canonical columns (net_ppe, total_assets, etc.)
+      removed.  Screener IS the authoritative source — no dual
+      scr_*/canonical pairs.
+    • scr_ prefix stripped from every balance_sheet column.
+    • Full sub-breakdown now stored:
+        Borrowings  → lt_borrowings, st_borrowings, lease_liabilities,
+                      preference_capital, other_borrowings
+        OtherLiab   → minority_interest, trade_payables,
+                      advance_from_customers, other_liability_items
+        OtherAssets → inventories, trade_receivables,
+                      receivables_over_6m, receivables_under_6m,
+                      prov_doubtful_debts, cash_equivalents,
+                      loans_advances, other_asset_items
+    • total_equity derived on insert (equity_capital + reserves).
+    • net_debt derived on insert (borrowings - cash_equivalents).
+    • reconcile_balance_sheet() simplified — nothing to merge from
+      yfinance anymore.
 ────────────────────────────────────────────────────────────────
 """
 
@@ -48,6 +33,7 @@ import pandas as pd
 from database.db import get_connection
 from database.validator import (validate_before_insert, compute_completeness,
                                  log_data_quality)
+
 
 # ── Safe DataFrame check ──────────────────────────────────────
 
@@ -125,12 +111,59 @@ def _safe_float(v) -> Optional[float]:
         return None
 
 
-# ── BS completeness fields (must match reconcile._BS_FIELDS) ─
+# ── BS completeness fields ────────────────────────────────────
+# These are the columns that matter for quality scoring.
 _BS_COMPLETENESS_FIELDS = [
-    "total_assets", "current_assets", "total_liabilities",
-    "total_equity", "total_debt", "net_debt",
-    "scr_equity_capital", "scr_reserves", "scr_borrowings", "scr_total_assets",
+    "equity_capital", "reserves", "total_equity",
+    "borrowings", "lt_borrowings", "st_borrowings",
+    "total_liabilities",
+    "fixed_assets", "cwip",
+    "inventories", "trade_receivables", "cash_equivalents",
+    "total_assets",
+    "net_debt",
 ]
+
+
+def _ensure_bs_columns(conn):
+    """Add any missing columns to balance_sheet (idempotent)."""
+    new_cols = [
+        ("lt_borrowings",          "REAL"),
+        ("st_borrowings",          "REAL"),
+        ("lease_liabilities",      "REAL"),
+        ("preference_capital",     "REAL"),
+        ("other_borrowings",       "REAL"),
+        ("minority_interest",      "REAL"),
+        ("trade_payables",         "REAL"),
+        ("advance_from_customers", "REAL"),
+        ("other_liability_items",  "REAL"),
+        ("inventories",            "REAL"),
+        ("trade_receivables",      "REAL"),
+        ("receivables_over_6m",    "REAL"),
+        ("receivables_under_6m",   "REAL"),
+        ("prov_doubtful_debts",    "REAL"),
+        ("loans_advances",         "REAL"),
+        ("other_asset_items",      "REAL"),
+        ("net_debt",               "REAL"),
+        # ensure old scr_ names are gone (rename handled in SQL migration;
+        # here we just ensure canonical names exist)
+        ("equity_capital",         "REAL"),
+        ("reserves",               "REAL"),
+        ("borrowings",             "REAL"),
+        ("other_liabilities",      "REAL"),
+        ("total_liabilities",      "REAL"),
+        ("fixed_assets",           "REAL"),
+        ("cwip",                   "REAL"),
+        ("investments",            "REAL"),
+        ("other_assets",           "REAL"),
+        ("cash_equivalents",       "REAL"),
+        ("total_equity",           "REAL"),
+        ("total_assets",           "REAL"),
+    ]
+    for col_name, col_type in new_cols:
+        try:
+            conn.execute(f"ALTER TABLE balance_sheet ADD COLUMN {col_name} {col_type}")
+        except Exception:
+            pass  # column already exists
 
 
 def _bs_completeness(conn, symbol: str, period_end: str, period_type: str):
@@ -158,7 +191,7 @@ def _bs_completeness(conn, symbol: str, period_end: str, period_type: str):
 def load_overview_from_screener(overview: dict, symbol: str):
     """
     Writes Screener overview ratios into fundamentals.
-    Also computes: graham_number, ttm_eps, ttm_pe from DB data.
+    Computes: graham_number, ttm_eps, ttm_pe from DB data.
     """
     if not overview:
         print("  warn  overview loader: no data")
@@ -167,7 +200,6 @@ def load_overview_from_screener(overview: dict, symbol: str):
     today = date.today().isoformat()
     conn  = get_connection()
 
-    # Ensure extra columns exist (idempotent)
     for col_name, col_type in [
         ("face_value",    "REAL"),
         ("high_52w",      "REAL"),
@@ -192,15 +224,10 @@ def load_overview_from_screener(overview: dict, symbol: str):
     roce          = _safe_float(overview.get("roce_pct"))
     div_yld       = _safe_float(overview.get("dividend_yield_pct"))
 
-    # market_cap: Screener gives Crores — store as Crores (consistent with yfinance loader)
-    mc = round(mc_cr * 100, 2) if mc_cr else None  # Cr → Rs Lakhs? No: keep Crores
-
-    # P/B from price and book_value
     pb_ratio = None
     if current_price and book_value and book_value > 0:
         pb_ratio = round(current_price / book_value, 2)
 
-    # Graham number = sqrt(22.5 * EPS * BookValue)
     graham = None
     try:
         r = conn.execute(
@@ -213,7 +240,6 @@ def load_overview_from_screener(overview: dict, symbol: str):
     except Exception:
         pass
 
-    # TTM EPS = sum of last 4 quarters EPS from quarterly_results
     ttm_eps = None
     ttm_pe  = None
     try:
@@ -367,7 +393,6 @@ def load_annual_results(df: pd.DataFrame, symbol: str):
     for col in df.columns:
         col_str = str(col).strip()
         if col_str.upper() == "TTM":
-            # Store TTM row with a special period_end = today
             period_end = date.today().isoformat()
             is_ttm = 1
         else:
@@ -421,16 +446,74 @@ def load_annual_results(df: pd.DataFrame, symbol: str):
 # ── Balance sheet ─────────────────────────────────────────────
 
 def load_balance_from_screener(df: pd.DataFrame, symbol: str):
+    """
+    Loads Screener balance sheet into the fully normalized balance_sheet table.
+    No yfinance columns. Screener is the only source.
+
+    Liabilities side:
+      equity_capital, reserves → total_equity (derived)
+      borrowings (bold) → lt_borrowings, st_borrowings, lease_liabilities,
+                           preference_capital, other_borrowings
+      other_liabilities (bold) → minority_interest, trade_payables,
+                                  advance_from_customers, other_liability_items
+      total_liabilities
+
+    Assets side:
+      fixed_assets (bold, net block — sub-rows not stored, vary by company)
+      cwip, investments
+      other_assets (bold) → inventories, trade_receivables,
+                             receivables_over_6m, receivables_under_6m,
+                             prov_doubtful_debts (negative),
+                             cash_equivalents, loans_advances, other_asset_items
+      total_assets
+
+    Derived on insert:
+      total_equity  = equity_capital + reserves
+      net_debt      = borrowings - cash_equivalents
+    """
     if not _has_data(df):
         print("  warn  balance_sheet screener: no data"); return
 
-    eq_r   = _row(df, "Equity Capital");   res_r  = _row(df, "Reserves")
-    bor_r  = _row(df, "Borrowings");       othl_r = _row(df, "Other Liabilities")
-    totl_r = _row(df, "Total Liabilities"); fix_r  = _row(df, "Fixed Assets")
-    cwip_r = _row(df, "CWIP");             inv_r  = _row(df, "Investments")
-    otha_r = _row(df, "Other Assets");     tota_r = _row(df, "Total Assets")
-
     conn = get_connection()
+    _ensure_bs_columns(conn)
+    conn.commit()
+
+    # ── Liabilities side ──────────────────────────────────────
+    eq_r      = _row(df, "Equity Capital")
+    res_r     = _row(df, "Reserves")
+
+    bor_r     = _row(df, "Borrowings")
+    lt_bor_r  = _row(df, "Long term Borrowings")
+    st_bor_r  = _row(df, "Short term Borrowings")
+    lease_r   = _row(df, "Lease Liabilities")
+    pref_r    = _row(df, "Preference Capital")
+    obor_r    = _row(df, "Other Borrowings")
+
+    othl_r    = _row(df, "Other Liabilities")
+    minint_r  = _row(df, "Non controlling int")
+    tp_r      = _row(df, "Trade Payables")
+    adv_r     = _row(df, "Advance from Customers")
+    oliab_r   = _row(df, "Other liability items")
+
+    totl_r    = _row(df, "Total Liabilities")
+
+    # ── Assets side ───────────────────────────────────────────
+    fix_r     = _row(df, "Fixed Assets")
+    cwip_r    = _row(df, "CWIP")
+    inv_r     = _row(df, "Investments")
+
+    otha_r    = _row(df, "Other Assets")
+    invtry_r  = _row(df, "Inventories")
+    trec_r    = _row(df, "Trade receivables")
+    rec6m_r   = _row(df, "Receivables over 6m")
+    recu6m_r  = _row(df, "Receivables under 6m")
+    prov_r    = _row(df, "Prov for Doubtful")
+    cash_r    = _row(df, "Cash Equivalents")
+    loans_r   = _row(df, "Loans n Advances")
+    oasset_r  = _row(df, "Other asset items")
+
+    tota_r    = _row(df, "Total Assets")
+
     count = 0
 
     for col in df.columns:
@@ -439,78 +522,129 @@ def load_balance_from_screener(df: pd.DataFrame, symbol: str):
         if not period_end:
             continue
 
-        # FIX BUG 2: period_type — Screener BS columns are:
-        #   "Mar YYYY" → annual
-        #   "Sep YYYY" → half_year (interim)
-        # Both are valid but must match what yfinance inserts (always "annual")
-        # for the conflict-key to work. Screener "Mar" rows are annual; "Sep"
-        # rows are genuinely half-year and stored separately (no yfinance conflict).
+        # Screener BS columns: "Mar YYYY" = annual, "Sep YYYY" = half_year
         mon = col_str[:3].lower()
-        if mon == "mar":
-            period_type = "annual"
-        elif mon in ("sep", "oct", "nov", "dec", "jan", "feb"):
-            period_type = "half_year"
-        else:
-            period_type = "annual"
+        period_type = "annual" if mon == "mar" else (
+            "half_year" if mon in ("sep","oct","nov","dec","jan","feb") else "annual"
+        )
 
-        scr_total   = _v(tota_r, col)
-        if scr_total is None:
-            continue
+        total_assets = _v(tota_r, col)
+        if total_assets is None:
+            continue  # row has no data
 
-        # Derive total_equity from scr_equity_capital + scr_reserves
+        # Derived fields
         eq_cap = _v(eq_r,  col)
         res    = _v(res_r, col)
-        derived_equity = round(eq_cap + res, 2) if (eq_cap and res) else None
+        total_equity = round(eq_cap + res, 2) if (eq_cap is not None and res is not None) else None
 
-        total_liab = _v(totl_r, col)
-        if total_liab is None and scr_total and derived_equity:
-            total_liab = round(scr_total - derived_equity, 2)
-
-        total_debt = _v(bor_r, col)
+        borrowings    = _v(bor_r, col)
+        cash_eq       = _v(cash_r, col)
+        net_debt = (round(borrowings - cash_eq, 2)
+                    if borrowings is not None and cash_eq is not None else None)
 
         conn.execute("""
-            INSERT INTO balance_sheet (symbol, period_end, period_type,
-                total_assets, total_equity, stockholders_equity,
-                total_liabilities, total_debt,
-                scr_equity_capital, scr_reserves, scr_borrowings,
-                scr_other_liabilities, scr_total_liabilities,
-                scr_fixed_assets, scr_cwip, scr_investments,
-                scr_other_assets, scr_total_assets, data_source
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO balance_sheet (
+                symbol, period_end, period_type,
+
+                equity_capital, reserves, total_equity,
+
+                borrowings, lt_borrowings, st_borrowings,
+                lease_liabilities, preference_capital, other_borrowings,
+
+                other_liabilities, minority_interest, trade_payables,
+                advance_from_customers, other_liability_items,
+
+                total_liabilities,
+
+                fixed_assets, cwip, investments,
+
+                other_assets, inventories, trade_receivables,
+                receivables_over_6m, receivables_under_6m, prov_doubtful_debts,
+                cash_equivalents, loans_advances, other_asset_items,
+
+                total_assets,
+
+                net_debt,
+                data_source
+            ) VALUES (
+                ?,?,?,
+                ?,?,?,
+                ?,?,?,?,?,?,
+                ?,?,?,?,?,
+                ?,
+                ?,?,?,
+                ?,?,?,?,?,?,?,?,?,
+                ?,
+                ?,?
+            )
             ON CONFLICT(symbol, period_end, period_type) DO UPDATE SET
-                total_assets        = COALESCE(total_assets,      excluded.total_assets),
-                total_equity        = COALESCE(total_equity,      excluded.total_equity),
-                stockholders_equity = COALESCE(stockholders_equity, excluded.stockholders_equity),
-                total_liabilities   = COALESCE(total_liabilities, excluded.total_liabilities),
-                total_debt          = COALESCE(total_debt,        excluded.total_debt),
-                scr_equity_capital  = excluded.scr_equity_capital,
-                scr_reserves        = excluded.scr_reserves,
-                scr_borrowings      = excluded.scr_borrowings,
-                scr_other_liabilities = excluded.scr_other_liabilities,
-                scr_total_liabilities = excluded.scr_total_liabilities,
-                scr_fixed_assets    = excluded.scr_fixed_assets,
-                scr_cwip            = excluded.scr_cwip,
-                scr_investments     = excluded.scr_investments,
-                scr_other_assets    = excluded.scr_other_assets,
-                scr_total_assets    = excluded.scr_total_assets,
-                data_source = CASE WHEN data_source='yfinance' THEN 'both'
-                                   ELSE 'screener' END
+                equity_capital          = excluded.equity_capital,
+                reserves                = excluded.reserves,
+                total_equity            = excluded.total_equity,
+
+                borrowings              = excluded.borrowings,
+                lt_borrowings           = excluded.lt_borrowings,
+                st_borrowings           = excluded.st_borrowings,
+                lease_liabilities       = excluded.lease_liabilities,
+                preference_capital      = excluded.preference_capital,
+                other_borrowings        = excluded.other_borrowings,
+
+                other_liabilities       = excluded.other_liabilities,
+                minority_interest       = excluded.minority_interest,
+                trade_payables          = excluded.trade_payables,
+                advance_from_customers  = excluded.advance_from_customers,
+                other_liability_items   = excluded.other_liability_items,
+
+                total_liabilities       = excluded.total_liabilities,
+
+                fixed_assets            = excluded.fixed_assets,
+                cwip                    = excluded.cwip,
+                investments             = excluded.investments,
+
+                other_assets            = excluded.other_assets,
+                inventories             = excluded.inventories,
+                trade_receivables       = excluded.trade_receivables,
+                receivables_over_6m     = excluded.receivables_over_6m,
+                receivables_under_6m    = excluded.receivables_under_6m,
+                prov_doubtful_debts     = excluded.prov_doubtful_debts,
+                cash_equivalents        = excluded.cash_equivalents,
+                loans_advances          = excluded.loans_advances,
+                other_asset_items       = excluded.other_asset_items,
+
+                total_assets            = excluded.total_assets,
+
+                net_debt                = excluded.net_debt,
+                data_source             = 'screener'
         """, (
             symbol, period_end, period_type,
-            scr_total, derived_equity, derived_equity,
-            total_liab, total_debt,
-            eq_cap, res, _v(bor_r, col),
-            _v(othl_r, col), _v(totl_r, col),
+
+            eq_cap, res, total_equity,
+
+            borrowings,     _v(lt_bor_r, col), _v(st_bor_r, col),
+            _v(lease_r, col), _v(pref_r, col), _v(obor_r, col),
+
+            _v(othl_r, col), _v(minint_r, col), _v(tp_r, col),
+            _v(adv_r, col),  _v(oliab_r, col),
+
+            _v(totl_r, col),
+
             _v(fix_r, col), _v(cwip_r, col), _v(inv_r, col),
-            _v(otha_r, col), scr_total, "screener",
+
+            _v(otha_r, col), _v(invtry_r, col), _v(trec_r, col),
+            _v(rec6m_r, col), _v(recu6m_r, col), _v(prov_r, col),
+            cash_eq, _v(loans_r, col), _v(oasset_r, col),
+
+            total_assets,
+
+            net_debt,
+            "screener",
         ))
 
-        # FIX BUG 1: recompute completeness after screener data written
         _bs_completeness(conn, symbol, period_end, period_type)
         count += 1
 
     conn.commit(); conn.close()
-    print(f"  ok  balance_sheet: {count} Screener rows merged (completeness recomputed)")
+    print(f"  ok  balance_sheet: {count} Screener rows upserted")
 
 
 # ── Cash flow ─────────────────────────────────────────────────
@@ -563,7 +697,7 @@ def load_cashflow_from_screener(df: pd.DataFrame, symbol: str):
                 best_operating_cf  = COALESCE(excluded.scr_cash_from_operating, best_operating_cf),
                 best_investing_cf  = COALESCE(excluded.scr_cash_from_investing, best_investing_cf),
                 best_financing_cf  = COALESCE(excluded.scr_cash_from_financing, best_financing_cf),
-                best_free_cash_flow= COALESCE(excluded.scr_free_cash_flow, best_free_cash_flow),
+                best_free_cash_flow = COALESCE(excluded.scr_free_cash_flow, best_free_cash_flow),
                 data_source = CASE WHEN data_source='yfinance' THEN 'both'
                                    ELSE 'screener' END
         """, (
@@ -575,54 +709,43 @@ def load_cashflow_from_screener(df: pd.DataFrame, symbol: str):
         count += 1
 
     conn.commit(); conn.close()
-    print(f"  ok  cash_flow: {count} Screener rows merged (best_* resolved)")
+    print(f"  ok  cash_flow: {count} Screener rows upserted")
 
 
 # ── Growth metrics ────────────────────────────────────────────
-# FIX BUG 3: JSON columns removed. Only scalar CAGR columns stored.
-# Screener "growth-numbers" section columns are like:
-#   "10 Years" / "5 Years" / "3 Years" / "TTM"
-# gv() tries both with-s and without-s variants.
 
 def load_growth_from_screener(df: pd.DataFrame, symbol: str):
     if not _has_data(df):
-        print("  warn  growth_metrics screener: no data"); return
+        print("  warn  growth screener: no data"); return
 
-    today = date.today().isoformat()
-
-    def gv(metric_substr: str, *period_variants) -> Optional[float]:
-        metric_row = None
-        for idx in df.index:
-            if metric_substr.lower() in str(idx).lower():
-                metric_row = df.loc[idx]
-                break
-        if metric_row is None:
+    def gv(row_name, *col_names):
+        r = _row(df, row_name)
+        if r is None:
             return None
-        for period in period_variants:
-            for col in df.columns:
-                col_str = str(col).strip()
-                if period.lower() == col_str.lower():
-                    return _v(metric_row, col)
-                if period.lower() in col_str.lower():
-                    return _v(metric_row, col)
+        for c in col_names:
+            for actual_col in df.columns:
+                if str(c).lower() in str(actual_col).lower():
+                    v = _v(r, actual_col)
+                    if v is not None:
+                        return v
         return None
 
-    sales_10y  = gv("Sales Growth",      "10 Years", "10 Year", "10Y")
-    sales_5y   = gv("Sales Growth",      "5 Years",  "5 Year",  "5Y")
-    sales_3y   = gv("Sales Growth",      "3 Years",  "3 Year",  "3Y")
-    sales_ttm  = gv("Sales Growth",      "TTM",      "Ttm")
-    profit_10y = gv("Profit Growth",     "10 Years", "10 Year", "10Y")
-    profit_5y  = gv("Profit Growth",     "5 Years",  "5 Year",  "5Y")
-    profit_3y  = gv("Profit Growth",     "3 Years",  "3 Year",  "3Y")
-    profit_ttm = gv("Profit Growth",     "TTM",      "Ttm")
-    stock_10y  = gv("Stock Price CAGR",  "10 Years", "10 Year", "10Y")
-    stock_5y   = gv("Stock Price CAGR",  "5 Years",  "5 Year",  "5Y")
-    stock_3y   = gv("Stock Price CAGR",  "3 Years",  "3 Year",  "3Y")
-    stock_ttm  = gv("Stock Price CAGR",  "TTM",      "1 Year",  "1Y")
-    roe_10y    = gv("Return on Equity",  "10 Years", "10 Year", "10Y")
-    roe_5y     = gv("Return on Equity",  "5 Years",  "5 Year",  "5Y")
-    roe_3y     = gv("Return on Equity",  "3 Years",  "3 Year",  "3Y")
-    roe_last   = gv("Return on Equity",  "TTM",      "Ttm", "Last Year")
+    sales_10y  = gv("Sales Growth",   "10 Years", "10Y",  "10Yr")
+    sales_5y   = gv("Sales Growth",   "5 Years",  "5Y",   "5Yr")
+    sales_3y   = gv("Sales Growth",   "3 Years",  "3Y",   "3Yr")
+    sales_ttm  = gv("Sales Growth",   "TTM")
+    profit_10y = gv("Profit Growth",  "10 Years", "10Y",  "10Yr")
+    profit_5y  = gv("Profit Growth",  "5 Years",  "5Y",   "5Yr")
+    profit_3y  = gv("Profit Growth",  "3 Years",  "3Y",   "3Yr")
+    profit_ttm = gv("Profit Growth",  "TTM")
+    stock_10y  = gv("Stock Price CAGR","10 Years","10Y",  "10Yr")
+    stock_5y   = gv("Stock Price CAGR","5 Years", "5Y",   "5Yr")
+    stock_3y   = gv("Stock Price CAGR","3 Years", "3Y",   "3Yr")
+    stock_ttm  = gv("Stock Price CAGR","TTM",     "1 Year","1Y")
+    roe_10y    = gv("Return on Equity","10 Years","10Y",  "10Yr")
+    roe_5y     = gv("Return on Equity","5 Years", "5Y",   "5Yr")
+    roe_3y     = gv("Return on Equity","3 Years", "3Y",   "3Yr")
+    roe_last   = gv("Return on Equity","TTM",     "Ttm",  "Last Year")
 
     print(f"  debug growth cols: {list(df.columns)}")
     print(f"  debug growth rows: {list(df.index)}")
@@ -631,7 +754,8 @@ def load_growth_from_screener(df: pd.DataFrame, symbol: str):
         sales_3y, profit_3y, sales_10y, profit_10y, roe_last
     ]) else 0
 
-    conn = get_connection()
+    today = date.today().isoformat()
+    conn  = get_connection()
     conn.execute("""
         INSERT INTO growth_metrics (symbol, as_of_date,
             scr_sales_cagr_10y, scr_sales_cagr_5y, scr_sales_cagr_3y, scr_sales_ttm,
@@ -688,9 +812,7 @@ def load_fundamentals_from_screener(ratios_df: pd.DataFrame, symbol: str):
     ccc  = _v(_row(ratios_df, "Cash Conversion Cycle"), col)
     wcd  = _v(_row(ratios_df, "Working Capital Days"),  col)
     roce = _v(_row(ratios_df, "ROCE %"),                col)
-
-    # Also try to extract Book Value from Ratios if present
-    bv = _v(_row(ratios_df, "Book Value"), col)
+    bv   = _v(_row(ratios_df, "Book Value"),            col)
 
     conn = get_connection()
 
@@ -735,7 +857,8 @@ def load_fundamentals_from_screener(ratios_df: pd.DataFrame, symbol: str):
     """, (symbol, today, dso, dio, dpo, ccc, wcd, roce, opm, div_payout, bv, "screener"))
 
     conn.commit(); conn.close()
-    print(f"  ok  fundamentals: Screener ratios merged | ROCE={roce} OPM={opm} WCD={wcd} DivPayout={div_payout} BookVal={bv}")
+    print(f"  ok  fundamentals: Screener ratios merged | ROCE={roce} OPM={opm} WCD={wcd} "
+          f"DivPayout={div_payout} BookVal={bv}")
 
 
 # ── Ownership history ─────────────────────────────────────────
@@ -784,16 +907,13 @@ def load_ownership_history(df: pd.DataFrame, symbol: str):
 
 def load_all_screener(data: dict, symbol: str):
     """
-    Dispatcher. Uses _has_data() for all checks to avoid pandas
-    DataFrame ambiguity errors.
-
-    Order matters:
-      1. quarterly_results first (overview loader needs EPS)
-      2. annual_results  (overview loader needs EPS + div_payout)
-      3. overview        (computes graham, ttm_eps using above)
-      4. balance_sheet
+    Dispatcher. Load order matters:
+      1. quarterly_results  (overview loader needs EPS)
+      2. annual_results     (overview loader needs EPS + div_payout)
+      3. overview           (computes graham, ttm_eps using above)
+      4. balance_sheet      (normalized Screener-only)
       5. cash_flow
-      6. ratios          (may also provide book_value)
+      6. ratios             (may also provide book_value)
       7. growth
       8. shareholding
     """
@@ -803,7 +923,6 @@ def load_all_screener(data: dict, symbol: str):
     if _has_data(data.get("profit_loss")):
         load_annual_results(data["profit_loss"], symbol)
 
-    # Overview AFTER quarterly/annual so EPS is available for graham + ttm
     if _has_data(data.get("overview")):
         load_overview_from_screener(data["overview"], symbol)
 

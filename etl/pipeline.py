@@ -9,16 +9,7 @@
 #
 # 2. ADD one call right after the DEDUP block and BEFORE run_reconciliation:
 #
-#    # ── Balance canonical backfill ──────────────────────────────────────────
-#    # Fills canonical cols (total_assets, total_equity, etc.) from scr_* for
-#    # any row where yfinance had no data (pre-2022 annual rows).
-#    # Safe to run multiple times — COALESCE prevents overwriting real data.
-#    try:
-#        backfill_balance_canonical(symbol_nse)
-#    except Exception as e:
-#        print(f"  error balance_backfill: {e}")
-#
-#
+#    
 # That's it. No other files touched.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -59,8 +50,7 @@ from etl.load.stock_loader              import insert_stock
 from etl.load.price_loader              import load_price
 from etl.load.technical_loader          import load_technicals
 from etl.load.fundamentals_loader       import load_fundamentals
-from etl.load.income_loader             import load_income
-from etl.load.balance_loader            import load_balance, backfill_balance_canonical   # ← v4.1
+from etl.load.income_loader             import load_income   # ← v4.1
 from etl.load.cashflow_loader           import load_cashflow
 from etl.load.corporate_actions_loader  import load_corporate_actions
 from etl.load.macro_loader              import (load_market_indices, load_forex_commodities,
@@ -167,36 +157,43 @@ def run_pipeline(symbol_yf: str = "ADANIPORTS.NS"):
     time.sleep(0.5)
 
     # ── 6. yfinance statements (detailed line items) ───────────
+    # ── 6. yfinance statements (ONLY income + cashflow) ───────────
     print(f"\n[6/11] Financial statements (yfinance detailed)...")
     stmts = {}
     try:
         stmts = fetch_statements(symbol_yf)
 
-        load_income(_safe_df(stmts.get("annual_income")),  symbol_nse, "annual")
-        load_balance(_safe_df(stmts.get("annual_bs")),     symbol_nse, "annual", 0)
-        load_cashflow(_safe_df(stmts.get("annual_cf")),    symbol_nse, "annual")
+    # ✅ KEEP income
+        load_income(_safe_df(stmts.get("annual_income")), symbol_nse, "annual")
 
+    # ❌ REMOVE balance sheet loading completely
+    # load_balance(_safe_df(stmts.get("annual_bs")), symbol_nse, "annual", 0)
+
+    # ✅ KEEP cashflow
+        load_cashflow(_safe_df(stmts.get("annual_cf")), symbol_nse, "annual")
+
+    # Quarterly
         q_inc = _safe_df(stmts.get("q_income"))
         if q_inc is not None:
             load_income(q_inc, symbol_nse, "quarterly")
 
-        # _safe_df() prevents DataFrame truth-value ambiguity error
-        q_bs = _safe_df(stmts.get("q_bs_extended"))
-        if q_bs is None:
-            q_bs = _safe_df(stmts.get("q_bs"))
-        if q_bs is not None:
-            load_balance(q_bs, symbol_nse, "quarterly", 0)
+    # ❌ REMOVE THIS BLOCK COMPLETELY
+    # q_bs = _safe_df(stmts.get("q_bs_extended"))
+    # if q_bs is None:
+    #     q_bs = _safe_df(stmts.get("q_bs"))
+    # if q_bs is not None:
+    #     load_balance(q_bs, symbol_nse, "quarterly", 0)
 
         q_cf = _safe_df(stmts.get("q_cf"))
         if q_cf is not None:
             load_cashflow(q_cf, symbol_nse, "quarterly")
 
         ok_mods.append("statements_yf")
-    except Exception as e:
-        print(f"  error statements_yf: {e}"); warn_mods.append("statements_yf")
-        import traceback; traceback.print_exc()
 
-    time.sleep(0.5)
+    except Exception as e:
+        print(f"  error statements_yf: {e}")
+        warn_mods.append("statements_yf")
+        import traceback; traceback.print_exc()
 
     # ── 7. Corporate actions ───────────────────────────────────
     print(f"\n[7/11] Corporate actions...")
@@ -290,16 +287,7 @@ def run_pipeline(symbol_yf: str = "ADANIPORTS.NS"):
     except Exception as e:
         print(f"  dedup error: {e}")
 
-    # ── Balance canonical backfill ─────────────────────────────
-    # Fills canonical cols (total_assets, total_equity, total_debt,
-    # net_ppe, etc.) from scr_* for rows where yfinance had no data
-    # (pre-2022 annual rows and any gaps). COALESCE-guarded so real
-    # yfinance values are never overwritten.
-    try:
-        backfill_balance_canonical(symbol_nse)
-        ok_mods.append("balance_backfill")
-    except Exception as e:
-        print(f"  error balance_backfill: {e}"); warn_mods.append("balance_backfill")
+
 
     # ── Reconciliation ─────────────────────────────────────────
     # Must run AFTER dedup. Fixes the 4 broken tables:
