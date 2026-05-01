@@ -14,6 +14,6 @@ __pycache__/
 # OS files
 .DS_Store
 Thumbs.db
-
+.csv
 # Logs
 *.log
