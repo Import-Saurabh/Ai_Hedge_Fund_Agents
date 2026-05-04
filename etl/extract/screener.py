@@ -729,6 +729,11 @@ def fetch_screener_data(symbol_nse: str) -> Dict[str, Any]:
         # This heuristic works for ~95% of NSE-listed companies.
         consolidated = "consolidated" in html[:5000].lower()
 
+    # ── Extract company_id once and store it — used by both BS and CF loaders ──
+    company_id = _extract_company_id(html)
+    result["company_id"]   = company_id    # int | None
+    result["consolidated"] = consolidated  # bool
+
     bs_schedules = fetch_bs_schedules(symbol_nse, html, consolidated)
     result["bs_schedules"] = bs_schedules
 

@@ -1,26 +1,11 @@
 """
-etl/load/screener_loader.py  v5.2
+etl/load/screener_loader.py  v5.4
 ────────────────────────────────────────────────────────────────
-Changes vs v5.1:
-  NEW — load_balance_schedules_backfill(schedules, symbol):
-    Screener's main HTML only exposes 10 top-level (bold) balance
-    sheet rows, leaving 17 sub-items NULL (Cash Equivalents,
-    Trade Receivables, Inventories, lt_borrowings, etc.).
-
-    screener.py v3.2 now fetches the /api/company/{id}/schedules/
-    endpoint for "Borrowings", "Other Liabilities", and "Other Assets"
-    and returns the merged sub-rows already injected into the
-    balance_sheet DataFrame.  This function provides a SECOND safety
-    net: it can also directly consume the raw bs_schedules dict and
-    backfill any columns still NULL after load_balance_from_screener().
-
-    The schedules API requires no login — just the numeric company ID
-    which screener.py extracts from the page HTML automatically.
-
-  UPDATED — load_all_screener():
-    Step 4b added: after loading the (now enriched) balance_sheet DF,
-    call load_balance_schedules_backfill() with the raw bs_schedules
-    dict as a defensive second pass for any columns still NULL.
+Changes vs v5.2:
+  • Removed columns receivables_over_6m, receivables_under_6m, prov_doubtful_debts
+    from balance_sheet table (no longer present in Screener's merged data).
+  • Fixed duplicate load_cashflow_from_screener() – only the new version remains.
+  • Added _ensure_cashflow_extra_cols() for completeness_pct / missing_fields_json.
 ────────────────────────────────────────────────────────────────
 """
 
@@ -33,6 +18,42 @@ import pandas as pd
 from database.db import get_connection
 from database.validator import (validate_before_insert, compute_completeness,
                                  log_data_quality)
+
+# ── HTTP helpers for schedules API (cashflow sub-items) ──────────────────────
+import time as _time
+try:
+    import httpx as _httpx
+    _USE_HTTPX = True
+except ImportError:
+    import requests as _requests
+    _USE_HTTPX = False
+
+_SCR_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+def _scr_get_json(url: str, retries: int = 3) -> Optional[dict]:
+    """GET a Screener API URL, return parsed JSON dict or None."""
+    for attempt in range(retries):
+        try:
+            if _USE_HTTPX:
+                r = _httpx.get(url, headers=_SCR_HEADERS, follow_redirects=True, timeout=20)
+            else:
+                r = _requests.get(url, headers=_SCR_HEADERS, timeout=20)
+            if r.status_code == 200:
+                data = r.json()
+                return data if isinstance(data, dict) else None
+            print(f"  warn  cf_schedules: HTTP {r.status_code} — {url}")
+        except Exception as e:
+            print(f"  warn  cf_schedules attempt {attempt+1}: {e}")
+        _time.sleep(1.5 * (attempt + 1))
+    return None
 
 
 # ── Safe DataFrame check ──────────────────────────────────────
@@ -112,7 +133,6 @@ def _safe_float(v) -> Optional[float]:
 
 
 # ── BS completeness fields ────────────────────────────────────
-# These are the columns that matter for quality scoring.
 _BS_COMPLETENESS_FIELDS = [
     "equity_capital", "reserves", "total_equity",
     "borrowings", "lt_borrowings", "st_borrowings",
@@ -124,7 +144,6 @@ _BS_COMPLETENESS_FIELDS = [
 ]
 
 # ── ALL expected Screener BS row labels → DB column name ─────
-# Used for the diagnostic print at load time.
 _BS_EXPECTED_ROWS = {
     # Liabilities
     "Equity Capital":          "equity_capital",
@@ -148,21 +167,18 @@ _BS_EXPECTED_ROWS = {
     "Other Assets":            "other_assets",
     "Inventories":             "inventories",
     "Trade receivables":       "trade_receivables",
-    "Receivables over 6m":     "receivables_over_6m",
-    "Receivables under 6m":    "receivables_under_6m",
-    "Prov for Doubtful":       "prov_doubtful_debts",
     "Cash Equivalents":        "cash_equivalents",
     "Loans n Advances":        "loans_advances",
     "Other asset items":       "other_asset_items",
     "Total Assets":            "total_assets",
 }
 
+# ── Balance sheet schema migration ───────────────────────────
 
 def _ensure_bs_columns(conn):
     """
     Add any missing columns to balance_sheet (idempotent).
-    CRITICAL: completeness_pct and missing_fields_json are included here
-    so reconcile.py never hits 'no such column' errors.
+    Completeness columns are included. Removed obsolete receivable/prov columns.
     """
     new_cols = [
         # Sub-breakdown columns
@@ -177,9 +193,6 @@ def _ensure_bs_columns(conn):
         ("other_liability_items",  "REAL"),
         ("inventories",            "REAL"),
         ("trade_receivables",      "REAL"),
-        ("receivables_over_6m",    "REAL"),
-        ("receivables_under_6m",   "REAL"),
-        ("prov_doubtful_debts",    "REAL"),
         ("loans_advances",         "REAL"),
         ("other_asset_items",      "REAL"),
         ("net_debt",               "REAL"),
@@ -196,7 +209,7 @@ def _ensure_bs_columns(conn):
         ("cash_equivalents",       "REAL"),
         ("total_equity",           "REAL"),
         ("total_assets",           "REAL"),
-        # ── FIX: these two were missing — caused reconcile crash ──
+        # Completeness columns
         ("completeness_pct",       "REAL"),
         ("missing_fields_json",    "TEXT"),
     ]
@@ -206,17 +219,13 @@ def _ensure_bs_columns(conn):
             conn.execute(f"ALTER TABLE balance_sheet ADD COLUMN {col_name} {col_type}")
             added.append(col_name)
         except Exception:
-            pass  # column already exists
+            pass
     if added:
         print(f"  db-migrate balance_sheet: added columns → {', '.join(added)}")
 
 
 def _bs_completeness(conn, symbol: str, period_end: str, period_type: str):
-    """
-    Recompute and write completeness_pct + missing_fields_json for a BS row.
-    Safe: if either column still somehow doesn't exist this will raise a clear error.
-    """
-    # Safety: ensure columns exist before writing
+    """Recompute completeness for a BS row."""
     for col_name, col_type in [("completeness_pct", "REAL"), ("missing_fields_json", "TEXT")]:
         try:
             conn.execute(f"ALTER TABLE balance_sheet ADD COLUMN {col_name} {col_type}")
@@ -244,10 +253,6 @@ def _bs_completeness(conn, symbol: str, period_end: str, period_type: str):
 # ── Overview loader ───────────────────────────────────────────
 
 def load_overview_from_screener(overview: dict, symbol: str):
-    """
-    Writes Screener overview ratios into fundamentals.
-    Computes: graham_number, ttm_eps, ttm_pe from DB data.
-    """
     if not overview:
         print("  warn  overview loader: no data")
         return
@@ -498,14 +503,9 @@ def load_annual_results(df: pd.DataFrame, symbol: str):
     print(f"  ok  annual_results: {count} rows (incl TTM if present)")
 
 
-# ── Balance sheet ─────────────────────────────────────────────
+# ── Balance sheet diagnostic ──────────────────────────────────
 
 def _print_bs_row_diagnostic(df: pd.DataFrame):
-    """
-    Print a table showing every expected BS row label and whether
-    it was found in the scraped Screener DataFrame index.
-    Missing rows = data gap that will produce NULLs in the DB.
-    """
     print(f"\n  ── Balance Sheet Row Diagnostic ──────────────────────────")
     print(f"  {'Screener Label':<30} {'DB Column':<28} {'Found?'}")
     print(f"  {'-'*30} {'-'*28} {'-'*6}")
@@ -514,7 +514,6 @@ def _print_bs_row_diagnostic(df: pd.DataFrame):
     missing_rows = []
 
     for label, col in _BS_EXPECTED_ROWS.items():
-        # Check exact match first, then substring
         found = any(label.lower() == s for s in scraped_index_lower)
         if not found:
             found = any(label.lower() in s for s in scraped_index_lower)
@@ -533,94 +532,52 @@ def _print_bs_row_diagnostic(df: pd.DataFrame):
         print(f"  ✅ All {len(_BS_EXPECTED_ROWS)} expected rows found in scraped data.")
     print(f"  ── End Diagnostic ────────────────────────────────────────\n")
 
-    # Also print actual scraped index so you can spot typos
     print(f"  Actual scraped row labels ({len(df.index)}):")
     for idx in df.index:
         print(f"    • '{idx}'")
     print()
 
 
+# ── Balance sheet loader ──────────────────────────────────────
+
 def load_balance_from_screener(df: pd.DataFrame, symbol: str):
-    """
-    Loads Screener balance sheet into the fully normalized balance_sheet table.
-    Screener is the ONLY source — no yfinance columns.
-
-    Liabilities side:
-      equity_capital, reserves → total_equity (derived)
-      borrowings (bold) → lt_borrowings, st_borrowings, lease_liabilities,
-                           preference_capital, other_borrowings
-      other_liabilities (bold) → minority_interest (non controlling int),
-                                  trade_payables, advance_from_customers,
-                                  other_liability_items
-      total_liabilities
-
-    Assets side:
-      fixed_assets (net block)
-      cwip, investments
-      other_assets (bold) → inventories, trade_receivables,
-                             receivables_over_6m, receivables_under_6m,
-                             prov_doubtful_debts (negative),
-                             cash_equivalents, loans_advances,
-                             other_asset_items
-      total_assets
-
-    Derived on insert:
-      total_equity  = equity_capital + reserves
-      net_debt      = borrowings - cash_equivalents
-    """
     if not _has_data(df):
         print("  warn  balance_sheet screener: no data"); return
 
     conn = get_connection()
-    _ensure_bs_columns(conn)   # ← adds completeness_pct + missing_fields_json
+    _ensure_bs_columns(conn)
     conn.commit()
 
-    # ── Print diagnostic BEFORE trying to load ────────────────
     _print_bs_row_diagnostic(df)
 
-    # ── Liabilities side ──────────────────────────────────────
+    # Liabilities side
     eq_r      = _row(df, "Equity Capital")
     res_r     = _row(df, "Reserves")
-
     bor_r     = _row(df, "Borrowings")
     lt_bor_r  = _row(df, "Long term Borrowings")
     st_bor_r  = _row(df, "Short term Borrowings")
     lease_r   = _row(df, "Lease Liabilities")
     pref_r    = _row(df, "Preference Capital")
     obor_r    = _row(df, "Other Borrowings")
-
     othl_r    = _row(df, "Other Liabilities")
-    # "Non controlling int" is Screener's label for minority interest
-    minint_r  = _row(df, "Non controlling int", "Non-controlling int",
-                     "Minority Interest", "Non Controlling Interest")
+    minint_r  = _row(df, "Non controlling int", "Non-controlling int", "Minority Interest", "Non Controlling Interest")
     tp_r      = _row(df, "Trade Payables")
     adv_r     = _row(df, "Advance from Customers", "Advances from Customers")
     oliab_r   = _row(df, "Other liability items", "Other Liability Items")
-
     totl_r    = _row(df, "Total Liabilities")
 
-    # ── Assets side ───────────────────────────────────────────
+    # Assets side
     fix_r     = _row(df, "Fixed Assets", "Net Block")
     cwip_r    = _row(df, "CWIP", "Capital Work in Progress")
     inv_r     = _row(df, "Investments")
-
     otha_r    = _row(df, "Other Assets")
     invtry_r  = _row(df, "Inventories")
-    trec_r    = _row(df, "Trade receivables", "Trade Receivables",
-                     "Debtors", "Sundry Debtors")
-    rec6m_r   = _row(df, "Receivables over 6m", "Receivables Over 6m")
-    recu6m_r  = _row(df, "Receivables under 6m", "Receivables Under 6m")
-    prov_r    = _row(df, "Prov for Doubtful", "Provision for Doubtful",
-                     "Prov. for Doubtful")
-    cash_r    = _row(df, "Cash Equivalents", "Cash & Equivalents",
-                     "Cash and Equivalents")
-    loans_r   = _row(df, "Loans n Advances", "Loans and Advances",
-                     "Loans & Advances")
+    trec_r    = _row(df, "Trade receivables", "Trade Receivables", "Debtors", "Sundry Debtors")
+    cash_r    = _row(df, "Cash Equivalents", "Cash & Equivalents", "Cash and Equivalents")
+    loans_r   = _row(df, "Loans n Advances", "Loans and Advances", "Loans & Advances")
     oasset_r  = _row(df, "Other asset items", "Other Asset Items")
-
     tota_r    = _row(df, "Total Assets")
 
-    # ── Print which critical rows resolved ────────────────────
     print(f"  ── Balance Sheet Row Resolution ──────────────────────────")
     critical = {
         "equity_capital":   eq_r,
@@ -641,14 +598,12 @@ def load_balance_from_screener(df: pd.DataFrame, symbol: str):
     print(f"  ──────────────────────────────────────────────────────────\n")
 
     count = 0
-
     for col in df.columns:
         col_str    = str(col).strip()
         period_end = _parse_period(col_str)
         if not period_end:
             continue
 
-        # Screener BS columns: "Mar YYYY" = annual, others = half_year
         mon = col_str[:3].lower()
         period_type = "annual" if mon == "mar" else (
             "half_year" if mon in ("sep","oct","nov","dec","jan","feb") else "annual"
@@ -656,10 +611,9 @@ def load_balance_from_screener(df: pd.DataFrame, symbol: str):
 
         total_assets = _v(tota_r, col)
         if total_assets is None:
-            continue  # row has no data
+            continue
 
-        # Derived fields
-        eq_cap = _v(eq_r,  col)
+        eq_cap = _v(eq_r, col)
         res    = _v(res_r, col)
         total_equity = round(eq_cap + res, 2) if (eq_cap is not None and res is not None) else None
 
@@ -668,10 +622,8 @@ def load_balance_from_screener(df: pd.DataFrame, symbol: str):
         net_debt = (round(borrowings - cash_eq, 2)
                     if borrowings is not None and cash_eq is not None else None)
 
-        # ── Per-row NULL report (only for first 3 cols to avoid spam) ──
         if count < 3:
-            row_nulls = []
-            field_checks = {
+            row_nulls = {k: v for k, v in {
                 "equity_capital": _v(eq_r, col),
                 "reserves":       _v(res_r, col),
                 "borrowings":     borrowings,
@@ -681,105 +633,66 @@ def load_balance_from_screener(df: pd.DataFrame, symbol: str):
                 "fixed_assets":   _v(fix_r, col),
                 "cash_equivalents": cash_eq,
                 "total_assets":   total_assets,
-            }
-            row_nulls = [k for k, v in field_checks.items() if v is None]
+            }.items() if v is None}
             if row_nulls:
-                print(f"  warn  bs[{col_str}] NULL fields: {row_nulls}")
+                print(f"  warn  bs[{col_str}] NULL fields: {list(row_nulls.keys())}")
 
         conn.execute("""
             INSERT INTO balance_sheet (
                 symbol, period_end, period_type,
-
                 equity_capital, reserves, total_equity,
-
                 borrowings, lt_borrowings, st_borrowings,
                 lease_liabilities, preference_capital, other_borrowings,
-
                 other_liabilities, minority_interest, trade_payables,
                 advance_from_customers, other_liability_items,
-
                 total_liabilities,
-
                 fixed_assets, cwip, investments,
-
                 other_assets, inventories, trade_receivables,
-                receivables_over_6m, receivables_under_6m, prov_doubtful_debts,
                 cash_equivalents, loans_advances, other_asset_items,
-
                 total_assets,
-
                 net_debt,
                 data_source
-            ) VALUES (
-                ?,?,?,
-                ?,?,?,
-                ?,?,?,?,?,?,
-                ?,?,?,?,?,
-                ?,
-                ?,?,?,
-                ?,?,?,?,?,?,?,?,?,
-                ?,
-                ?,?
-            )
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(symbol, period_end, period_type) DO UPDATE SET
                 equity_capital          = excluded.equity_capital,
                 reserves                = excluded.reserves,
                 total_equity            = excluded.total_equity,
-
                 borrowings              = excluded.borrowings,
                 lt_borrowings           = excluded.lt_borrowings,
                 st_borrowings           = excluded.st_borrowings,
                 lease_liabilities       = excluded.lease_liabilities,
                 preference_capital      = excluded.preference_capital,
                 other_borrowings        = excluded.other_borrowings,
-
                 other_liabilities       = excluded.other_liabilities,
                 minority_interest       = excluded.minority_interest,
                 trade_payables          = excluded.trade_payables,
                 advance_from_customers  = excluded.advance_from_customers,
                 other_liability_items   = excluded.other_liability_items,
-
                 total_liabilities       = excluded.total_liabilities,
-
                 fixed_assets            = excluded.fixed_assets,
                 cwip                    = excluded.cwip,
                 investments             = excluded.investments,
-
                 other_assets            = excluded.other_assets,
                 inventories             = excluded.inventories,
                 trade_receivables       = excluded.trade_receivables,
-                receivables_over_6m     = excluded.receivables_over_6m,
-                receivables_under_6m    = excluded.receivables_under_6m,
-                prov_doubtful_debts     = excluded.prov_doubtful_debts,
                 cash_equivalents        = excluded.cash_equivalents,
                 loans_advances          = excluded.loans_advances,
                 other_asset_items       = excluded.other_asset_items,
-
                 total_assets            = excluded.total_assets,
-
                 net_debt                = excluded.net_debt,
                 data_source             = 'screener'
         """, (
             symbol, period_end, period_type,
-
             eq_cap, res, total_equity,
-
-            borrowings,     _v(lt_bor_r, col), _v(st_bor_r, col),
+            borrowings, _v(lt_bor_r, col), _v(st_bor_r, col),
             _v(lease_r, col), _v(pref_r, col), _v(obor_r, col),
-
             _v(othl_r, col), _v(minint_r, col), _v(tp_r, col),
-            _v(adv_r, col),  _v(oliab_r, col),
-
+            _v(adv_r, col), _v(oliab_r, col),
             _v(totl_r, col),
-
             _v(fix_r, col), _v(cwip_r, col), _v(inv_r, col),
-
             _v(otha_r, col), _v(invtry_r, col), _v(trec_r, col),
-            _v(rec6m_r, col), _v(recu6m_r, col), _v(prov_r, col),
             cash_eq, _v(loans_r, col), _v(oasset_r, col),
-
             total_assets,
-
             net_debt,
             "screener",
         ))
@@ -791,20 +704,130 @@ def load_balance_from_screener(df: pd.DataFrame, symbol: str):
     print(f"  ok  balance_sheet: {count} Screener rows upserted")
 
 
-# ── Cash flow ─────────────────────────────────────────────────
+# ── Cash flow (new flexible schema) ───────────────────────────
 
-def load_cashflow_from_screener(df: pd.DataFrame, symbol: str):
+# ── Cash flow schedule constants ─────────────────────────────────────────────
+_CF_SCHEDULE_PARENTS = [
+    ("Operating Activity", "Cash+from+Operating+Activity"),
+    ("Investing Activity", "Cash+from+Investing+Activity"),
+    ("Financing Activity", "Cash+from+Financing+Activity"),
+]
+_CF_TOTAL_LABELS = {
+    "Operating Activity": ["cash from operating activity",
+                           "net cash from operating activities",
+                           "net cash provided by operating activities",
+                           "total operating"],
+    "Investing Activity": ["cash from investing activity",
+                           "net cash from investing activities",
+                           "net cash used in investing activities",
+                           "total investing"],
+    "Financing Activity": ["cash from financing activity",
+                           "net cash from financing activities",
+                           "net cash used in financing activities",
+                           "total financing"],
+}
+_CAPEX_LABELS = [
+    "fixed assets purchased", "purchase of fixed assets",
+    "purchase of property plant and equipment",
+    "capital expenditure", "capex", "additions to fixed assets",
+]
+
+
+def _cf_clean(text) -> Optional[float]:
+    if text is None:
+        return None
+    s = (str(text).strip()
+         .replace("₹","").replace("Cr.","").replace("Cr","")
+         .replace("%","").replace(",","").strip())
+    if s in ("","-","—","N/A","nan","None"):
+        return None
+    try:
+        return round(float(s), 2)
+    except ValueError:
+        return None
+
+
+def _cf_lk(label) -> str:
+    return str(label).lower().strip()
+
+
+def _cf_find_total(sub_items: dict, section: str) -> Optional[float]:
+    for cand in _CF_TOTAL_LABELS.get(section, []):
+        for lbl, val in sub_items.items():
+            if _cf_lk(lbl) == cand or cand in _cf_lk(lbl):
+                return _cf_clean(val)
+    return None
+
+
+def _cf_find_capex(inv_sub: dict) -> Optional[float]:
+    for cand in _CAPEX_LABELS:
+        for lbl, val in inv_sub.items():
+            if cand in _cf_lk(lbl):
+                return _cf_clean(val)
+    return None
+
+
+def _fetch_cf_schedules(company_id: int, consolidated: bool) -> dict:
+    """Fetch Operating/Investing/Financing sub-items from Screener schedules API."""
+    result = {}
+    cons = "" if consolidated else "false"
+    for section_name, parent_param in _CF_SCHEDULE_PARENTS:
+        url = (
+            f"https://www.screener.in/api/company/{company_id}/schedules/"
+            f"?parent={parent_param}&section=cash-flow&consolidated={cons}"
+        )
+        raw = _scr_get_json(url)
+        _time.sleep(0.4)
+        if raw and isinstance(raw, dict):
+            parsed = {}
+            for period_label, sub_items in raw.items():
+                if not isinstance(sub_items, dict):
+                    continue
+                cleaned = {str(k).strip(): _cf_clean(v) for k, v in sub_items.items()}
+                parsed[str(period_label).strip()] = cleaned
+            result[section_name] = parsed
+            sample = sorted(next(iter(parsed.values()), {}).keys())
+            print(f"  ok  cf_schedule [{section_name}]: {len(parsed)} periods  sub-items: {sample}")
+        else:
+            result[section_name] = {}
+            print(f"  warn  cf_schedule [{section_name}]: no data from API")
+    return result
+
+
+def load_cashflow_from_screener(df: pd.DataFrame, symbol: str,
+                                 company_id: Optional[int] = None,
+                                 consolidated: bool = True):
+    """
+    Load Screener cash flow data into cash_flow table.
+
+    Phase 1 — top-level HTML table (df): cfo / cfi / cff / ncf totals.
+    Phase 2 — schedules API (same endpoint as cashflow_scrapper.py):
+              all sub-category line items; capex from Investing subs.
+
+    All sub-items stored in raw_details_json as "Section > Sub Label" keys.
+    capex → free_cash_flow derived as cfo + capex.
+    net_cash_flow derived as cfo + cfi + cff when missing.
+    """
     if not _has_data(df):
-        print("  warn  cash_flow screener: no data"); return
+        print("  warn  cash_flow screener: no data")
+        return
 
-    ocf_r  = _row(df, "Cash from Operating Activity")
-    icf_r  = _row(df, "Cash from Investing Activity")
-    fcf_r  = _row(df, "Cash from Financing Activity")
-    ncf_r  = _row(df, "Net Cash Flow")
-    fcf2_r = _row(df, "Free Cash Flow")
-    cfo_r  = _row(df, "CFO/OP")
+    # Phase 1: top-level rows from Screener HTML table
+    ocf_row  = _row(df, "Cash from Operating Activity")
+    icf_row  = _row(df, "Cash from Investing Activity")
+    fcf_row  = _row(df, "Cash from Financing Activity")
+    ncf_row  = _row(df, "Net Cash Flow")
+    fcf2_row = _row(df, "Free Cash Flow")
 
-    conn = get_connection()
+    # Phase 2: sub-items via schedules API (mirrors cashflow_scrapper.py)
+    schedules: dict = {}
+    if company_id:
+        print(f"  ok  cf_schedules: fetching sub-items for company_id={company_id} ...")
+        schedules = _fetch_cf_schedules(company_id, consolidated)
+    else:
+        print("  warn  cf_schedules: no company_id — sub-items will be empty")
+
+    conn  = get_connection()
     count = 0
 
     for col in df.columns:
@@ -812,51 +835,177 @@ def load_cashflow_from_screener(df: pd.DataFrame, symbol: str):
         if not period_end:
             continue
 
-        ocf  = _v(ocf_r,  col)
-        icf  = _v(icf_r,  col)
-        ffcf = _v(fcf_r,  col)
-        ncf  = _v(ncf_r,  col)
-        fcf2 = _v(fcf2_r, col)
-        cfo  = _v(cfo_r,  col)
+        # Phase 1 values
+        cfo = _v(ocf_row,  col)
+        cfi = _v(icf_row,  col)
+        cff = _v(fcf_row,  col)
+        ncf = _v(ncf_row,  col)
+        fcf = _v(fcf2_row, col)
 
-        if ocf is None and fcf2 is None:
+        # Phase 2: sub-items for this period
+        col_str   = str(col).strip()
+        ops_items = schedules.get("Operating Activity", {}).get(col_str, {})
+        inv_items = schedules.get("Investing Activity", {}).get(col_str, {})
+        fin_items = schedules.get("Financing Activity", {}).get(col_str, {})
+
+        # Fill totals from schedules where top-level was None
+        if cfo is None: cfo = _cf_find_total(ops_items, "Operating Activity")
+        if cfi is None: cfi = _cf_find_total(inv_items, "Investing Activity")
+        if cff is None: cff = _cf_find_total(fin_items, "Financing Activity")
+
+        # Capex from Investing > Fixed assets purchased
+        capex = _cf_find_capex(inv_items)
+
+        # Derived metrics
+        if fcf is None and cfo is not None and capex is not None:
+            fcf = round(cfo + capex, 2)
+        if ncf is None and cfo is not None and cfi is not None and cff is not None:
+            ncf = round(cfo + cfi + cff, 2)
+
+        if cfo is None and fcf is None:
             continue
 
+        # Build raw_details_json: parent totals + ALL sub-items
+        raw_detail: dict = {}
+        if cfo   is not None: raw_detail["Operating Activity > Total"] = cfo
+        if cfi   is not None: raw_detail["Investing Activity > Total"] = cfi
+        if cff   is not None: raw_detail["Financing Activity > Total"] = cff
+        if ncf   is not None: raw_detail["Net Cash Flow"]              = ncf
+        if fcf   is not None: raw_detail["Free Cash Flow"]             = fcf
+        if capex is not None: raw_detail["Capex"]                      = capex
+        for sec, sub_items in [("Operating Activity", ops_items),
+                                ("Investing Activity", inv_items),
+                                ("Financing Activity", fin_items)]:
+            for sub_label, val in sub_items.items():
+                raw_detail[f"{sec} > {sub_label}"] = val
+
+        raw_json = json.dumps(raw_detail, default=str) if raw_detail else None
+
+        # Re-derive FCF from Screener capex so it stays internally consistent.
+        # Screener "Fixed assets purchased" = gross capex (purchases only).
+        # yfinance CapitalExpenditures = net capex (purchases minus proceeds) → too negative.
+        # Always use Screener's capex+CFO to compute FCF when both are available.
+        screener_fcf = round(cfo + capex, 2) if (cfo is not None and capex is not None) else fcf
+
         conn.execute("""
-            INSERT INTO cash_flow (symbol, period_end, period_type,
-                scr_cash_from_operating, scr_cash_from_investing,
-                scr_cash_from_financing, scr_net_cash_flow,
-                scr_free_cash_flow, scr_cfo_op_pct,
-                best_operating_cf, best_investing_cf,
-                best_financing_cf, best_free_cash_flow,
-                data_source, has_yf_detail
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO cash_flow (
+                symbol, period_end, period_type,
+                cfo, cfi, cff, capex, free_cash_flow, net_cash_flow,
+                raw_details_json, data_source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol, period_end, period_type) DO UPDATE SET
-                scr_cash_from_operating = excluded.scr_cash_from_operating,
-                scr_cash_from_investing = excluded.scr_cash_from_investing,
-                scr_cash_from_financing = excluded.scr_cash_from_financing,
-                scr_net_cash_flow       = excluded.scr_net_cash_flow,
-                scr_free_cash_flow      = excluded.scr_free_cash_flow,
-                scr_cfo_op_pct          = excluded.scr_cfo_op_pct,
-                best_operating_cf  = COALESCE(excluded.scr_cash_from_operating, best_operating_cf),
-                best_investing_cf  = COALESCE(excluded.scr_cash_from_investing, best_investing_cf),
-                best_financing_cf  = COALESCE(excluded.scr_cash_from_financing, best_financing_cf),
-                best_free_cash_flow = COALESCE(excluded.scr_free_cash_flow, best_free_cash_flow),
-                data_source = CASE WHEN data_source='yfinance' THEN 'both'
-                                   ELSE 'screener' END
+                cfo              = COALESCE(excluded.cfo,            cash_flow.cfo),
+                cfi              = COALESCE(excluded.cfi,            cash_flow.cfi),
+                cff              = COALESCE(excluded.cff,            cash_flow.cff),
+                capex            = COALESCE(excluded.capex,          cash_flow.capex),
+                free_cash_flow   = COALESCE(excluded.free_cash_flow, cash_flow.free_cash_flow),
+                net_cash_flow    = COALESCE(excluded.net_cash_flow,  cash_flow.net_cash_flow),
+                raw_details_json = excluded.raw_details_json,
+                data_source      = excluded.data_source,
+                updated_at       = CURRENT_TIMESTAMP
         """, (
             symbol, period_end, "annual",
-            ocf, icf, ffcf, ncf, fcf2, cfo,
-            ocf, icf, ffcf, fcf2,
-            "screener", 0,
+            cfo, cfi, cff, capex, screener_fcf, ncf,
+            raw_json, "screener",
         ))
         count += 1
 
-    conn.commit(); conn.close()
-    print(f"  ok  cash_flow: {count} Screener rows upserted")
+    conn.commit()
+
+    # ── Task 2: Diagnostic logging (mirrors balance-sheet diagnostic block) ──
+    latest = conn.execute("""
+        SELECT cfo, cfi, cff, capex, free_cash_flow, net_cash_flow, raw_details_json
+        FROM cash_flow WHERE symbol = ?
+        ORDER BY period_end DESC LIMIT 1
+    """, (symbol,)).fetchone()
+
+    print()
+    print("  ── Cash Flow Row Diagnostic ──────────────────────────────────────────────")
+    print(f"  {'Screener Label':<35} {'DB Column':<28} {'Found?'}")
+    print(f"  {'-'*35} {'-'*28} {'-'*6}")
+
+    def _diag(label: str, db_col: str, val) -> None:
+        status = "✅ yes" if val is not None else "❌ NULL"
+        print(f"  {label:<35} {db_col:<28} {status}")
+
+    if latest:
+        s_cfo, s_cfi, s_cff, s_capex, s_fcf, s_ncf, s_raw = latest
+
+        # Core columns
+        _diag("Cash from Operating Activity", "cfo",            s_cfo)
+        _diag("Cash from Investing Activity", "cfi",            s_cfi)
+        _diag("Cash from Financing Activity", "cff",            s_cff)
+        _diag("Fixed assets purchased (cap)", "capex",          s_capex)
+        _diag("Free Cash Flow (cfo+capex)",   "free_cash_flow", s_fcf)
+        _diag("Net Cash Flow",                "net_cash_flow",  s_ncf)
+
+        # Sub-item checks from raw_details_json
+        sub_count = 0
+        if s_raw:
+            try:
+                raw = json.loads(s_raw)
+                sub_checks = [
+                    ("Operating Activity > Profit from operations",   "raw: op_profit_ops"),
+                    ("Operating Activity > Working capital changes",   "raw: op_wc_changes"),
+                    ("Operating Activity > Direct taxes",              "raw: op_direct_taxes"),
+                    ("Investing Activity > Fixed assets purchased",    "raw: inv_fa_purchased"),
+                    ("Investing Activity > Fixed assets sold",         "raw: inv_fa_sold"),
+                    ("Investing Activity > Investments purchased",     "raw: inv_invest_purch"),
+                    ("Investing Activity > Interest received",         "raw: inv_interest_recv"),
+                    ("Investing Activity > Acquisition of companies",  "raw: inv_acquisition"),
+                    ("Financing Activity > Proceeds from borrowings",  "raw: fin_proc_borrow"),
+                    ("Financing Activity > Repayment of borrowings",   "raw: fin_repay_borrow"),
+                    ("Financing Activity > Interest paid fin",         "raw: fin_interest_paid"),
+                    ("Financing Activity > Dividends paid",            "raw: fin_dividends"),
+                ]
+                for raw_key, db_col in sub_checks:
+                    _diag(raw_key[:35], db_col, raw.get(raw_key))
+                sub_count = sum(1 for k in raw if ">" in k and "> Total" not in k)
+            except Exception:
+                pass
+
+        print(f"  {'─'*72}")
+        core_null = [f for f, v in [
+            ("cfo", s_cfo), ("cfi", s_cfi), ("cff", s_cff),
+            ("capex", s_capex), ("free_cash_flow", s_fcf), ("net_cash_flow", s_ncf),
+        ] if v is None]
+        if core_null:
+            print(f"  ⚠️  Missing core fields (latest period): {core_null}")
+        else:
+            print(f"  ✅ All {6} core cash flow fields populated (latest period)")
+        print(f"  📦 Sub-items stored in raw_details_json: {sub_count}")
+    else:
+        print("  ⚠️  No cash_flow rows found for diagnostic")
+
+    print("  ── End Cash Flow Diagnostic ──────────────────────────────────────────────")
+    print()
+
+    conn.close()
+    print(f"  ok  cash_flow: {count} Screener rows upserted (periods with data)")
 
 
 # ── Growth metrics ────────────────────────────────────────────
+
+# ── Task 3: Ensure UNIQUE index on growth_metrics(symbol, as_of_date) ────────
+
+def _ensure_growth_metrics_unique(conn) -> None:
+    """
+    Create UNIQUE INDEX on growth_metrics(symbol, as_of_date) if it doesn't
+    exist yet.  This makes the ON CONFLICT(symbol, as_of_date) clause in
+    etl/load/growth_loader.py (yfinance path) valid and stops the error:
+        "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"
+    Safe to call repeatedly — idempotent.
+    """
+    try:
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS
+                growth_metrics_symbol_date
+            ON growth_metrics(symbol, as_of_date)
+        """)
+        conn.commit()
+    except Exception as e:
+        print(f"  warn  _ensure_growth_metrics_unique: {e}")
+
 
 def load_growth_from_screener(df: pd.DataFrame, symbol: str):
     if not _has_data(df):
@@ -900,6 +1049,7 @@ def load_growth_from_screener(df: pd.DataFrame, symbol: str):
 
     today = date.today().isoformat()
     conn  = get_connection()
+    _ensure_growth_metrics_unique(conn)   # Task 3: ensure UNIQUE index exists
     conn.execute("""
         INSERT INTO growth_metrics (symbol, as_of_date,
             scr_sales_cagr_10y, scr_sales_cagr_5y, scr_sales_cagr_3y, scr_sales_ttm,
@@ -1049,8 +1199,6 @@ def load_ownership_history(df: pd.DataFrame, symbol: str):
 
 # ── Balance sheet schedules backfill ──────────────────────────
 
-# Maps canonical sub-labels (from screener.py's _merge_schedules_into_bs)
-# to DB column names in the balance_sheet table.
 _SCHEDULE_COL_MAP = {
     "Long term Borrowings":    "lt_borrowings",
     "Short term Borrowings":   "st_borrowings",
@@ -1063,43 +1211,25 @@ _SCHEDULE_COL_MAP = {
     "Other liability items":   "other_liability_items",
     "Inventories":             "inventories",
     "Trade receivables":       "trade_receivables",
-    "Receivables over 6m":     "receivables_over_6m",
-    "Receivables under 6m":    "receivables_under_6m",
-    "Prov for Doubtful":       "prov_doubtful_debts",
     "Cash Equivalents":        "cash_equivalents",
     "Loans n Advances":        "loans_advances",
 }
 
-# Same label normaliser as screener.py (copy so no cross-import needed)
 _SCHED_LABEL_MAP = [
-    # Borrowings
     (["long term borrowing"],          "Long term Borrowings"),
     (["short term borrowing"],         "Short term Borrowings"),
     (["lease liabilit"],               "Lease Liabilities"),
     (["preference capital"],           "Preference Capital"),
     (["other borrowing"],              "Other Borrowings"),
-    # Other Liabilities (specific before general)
-    (["non controlling", "minority interest", "non-controlling"],
-                                       "Non controlling int"),
+    (["non controlling", "minority interest", "non-controlling"], "Non controlling int"),
     (["trade payable"],                "Trade Payables"),
-    (["advance from customer"],        "Advance from Customers"),  # BEFORE "advance"
-    # Other Assets (specific before general)
+    (["advance from customer"],        "Advance from Customers"),
     (["inventor"],                     "Inventories"),
-    (["trade receivable", "debtors", "sundry debtor"],
-                                       "Trade receivables"),
-    (["receivable over 6", "receivable > 6", "over 6 month"],
-                                       "Receivables over 6m"),
-    (["receivable under 6", "receivable < 6", "under 6 month"],
-                                       "Receivables under 6m"),
-    (["prov for doubt", "provision for doubt", "prov. for doubt"],
-                                       "Prov for Doubtful"),
-    (["cash equivalent", "cash & equiv", "cash and bank",
-      "cash and equiv", "cash in hand", "bank balance",
-      "cash & bank", "cash at bank", "balance with bank"],
-                                       "Cash Equivalents"),
-    (["loan", "advance"],              "Loans n Advances"),  # AFTER advance_from_customers
+    (["trade receivable", "debtors", "sundry debtor"], "Trade receivables"),
+    (["cash equivalent", "cash & equiv", "cash and bank", "cash and equiv",
+      "cash in hand", "bank balance", "cash & bank", "cash at bank", "balance with bank"], "Cash Equivalents"),
+    (["loan", "advance"],              "Loans n Advances"),
 ]
-
 
 def _sched_canonical(sub_label: str) -> Optional[str]:
     n = str(sub_label).lower().strip()
@@ -1108,27 +1238,7 @@ def _sched_canonical(sub_label: str) -> Optional[str]:
             return canonical
     return None
 
-
 def load_balance_schedules_backfill(schedules: dict, symbol: str):
-    """
-    Second-pass backfill for balance_sheet sub-item columns using the raw
-    bs_schedules dict returned by screener.py's fetch_bs_schedules().
-
-    This is a DEFENSIVE complement to the enriched DataFrame path.
-    If screener.py already merged sub-rows into the balance_sheet DF
-    (and load_balance_from_screener picked them up), this function
-    will safely skip already-populated cells via COALESCE.
-
-    schedules format (from screener.py):
-      {
-        "Other Assets": {
-          "Mar 2024": {"Cash in hand": 12.34, "Bank Balance": 456.78, ...},
-          "Mar 2023": {...},
-        },
-        "Other Liabilities": {...},
-        "Borrowings": {...},
-      }
-    """
     if not schedules:
         print("  skip  bs_backfill: no schedules data")
         return
@@ -1138,34 +1248,25 @@ def load_balance_schedules_backfill(schedules: dict, symbol: str):
     conn.commit()
 
     backfilled = 0
-
     for parent_name, period_data in schedules.items():
         for period_label, sub_dict in period_data.items():
-            # Parse period label → DB period_end date
             period_end = _parse_period(str(period_label).strip())
             if not period_end:
                 continue
 
-            # Determine period_type
             mon = str(period_label).strip()[:3].lower()
             period_type = "annual" if mon == "mar" else (
-                "half_year" if mon in ("sep", "oct", "nov", "dec",
-                                       "jan", "feb") else "annual"
+                "half_year" if mon in ("sep", "oct", "nov", "dec", "jan", "feb") else "annual"
             )
 
-            # Check if the DB row exists at all
             exists = conn.execute(
-                "SELECT rowid FROM balance_sheet "
-                "WHERE symbol=? AND period_end=? AND period_type=?",
+                "SELECT rowid FROM balance_sheet WHERE symbol=? AND period_end=? AND period_type=?",
                 (symbol, period_end, period_type)
             ).fetchone()
             if not exists:
-                # Row never inserted — skip; load_balance_from_screener
-                # is the authoritative inserter.
                 continue
 
-            # Accumulate sub-label values per canonical column
-            col_vals: dict = {}
+            col_vals = {}
             for sub_label, value in sub_dict.items():
                 canonical = _sched_canonical(sub_label)
                 if canonical is None:
@@ -1176,17 +1277,14 @@ def load_balance_schedules_backfill(schedules: dict, symbol: str):
                 fv = _safe_float(value)
                 if fv is None:
                     continue
-                # Sum (e.g. "Cash in hand" + "Bank Balance" → cash_equivalents)
                 col_vals[db_col] = round(col_vals.get(db_col, 0.0) + fv, 4)
 
             if not col_vals:
                 continue
 
-            # Build UPDATE with COALESCE so we never overwrite existing data
             set_parts = [f"{col} = COALESCE({col}, ?)" for col in col_vals]
-            vals      = list(col_vals.values())
+            vals = list(col_vals.values())
             vals.extend([symbol, period_end, period_type])
-
             conn.execute(
                 f"UPDATE balance_sheet SET {', '.join(set_parts)} "
                 f"WHERE symbol=? AND period_end=? AND period_type=?",
@@ -1194,7 +1292,6 @@ def load_balance_schedules_backfill(schedules: dict, symbol: str):
             )
             backfilled += len(col_vals)
 
-    # Recompute completeness for all rows of this symbol
     rows = conn.execute(
         "SELECT period_end, period_type FROM balance_sheet WHERE symbol=?",
         (symbol,)
@@ -1205,18 +1302,10 @@ def load_balance_schedules_backfill(schedules: dict, symbol: str):
     conn.commit()
     conn.close()
 
-    # Also backfill net_debt using the refreshed cash_equivalents
     _backfill_net_debt(symbol)
-
-    print(f"  ok  bs_backfill: {backfilled} sub-cells backfilled for {symbol} "
-          f"(COALESCE — existing data preserved)")
-
+    print(f"  ok  bs_backfill: {backfilled} sub-cells backfilled for {symbol} (COALESCE — existing data preserved)")
 
 def _backfill_net_debt(symbol: str):
-    """
-    After schedules backfill, recompute net_debt = borrowings - cash_equivalents
-    for any row where net_debt is still NULL but both inputs are now known.
-    """
     conn = get_connection()
     rows = conn.execute("""
         SELECT rowid, borrowings, cash_equivalents
@@ -1244,19 +1333,6 @@ def _backfill_net_debt(symbol: str):
 # ── Master dispatcher ─────────────────────────────────────────
 
 def load_all_screener(data: dict, symbol: str):
-    """
-    Dispatcher. Load order matters:
-      1. quarterly_results  (overview loader needs EPS)
-      2. annual_results     (overview loader needs EPS + div_payout)
-      3. overview           (computes graham, ttm_eps using above)
-      4. balance_sheet      (normalized Screener-only)
-                            ← now enriched with schedule sub-rows by screener.py
-      4b. bs_schedules backfill (defensive second pass for NULLs)
-      5. cash_flow
-      6. ratios             (may also provide book_value)
-      7. growth
-      8. shareholding
-    """
     if _has_data(data.get("quarters")):
         load_quarterly_results(data["quarters"], symbol)
 
@@ -1269,16 +1345,18 @@ def load_all_screener(data: dict, symbol: str):
     if _has_data(data.get("balance_sheet")):
         load_balance_from_screener(data["balance_sheet"], symbol)
 
-    # ── 4b. Defensive backfill from raw schedules dict ────────
-    # screener.py already merged sub-rows into the balance_sheet DF,
-    # but this second pass catches any cells still NULL after the
-    # main load (e.g. if a column name didn't match in the DF merge).
     bs_schedules = data.get("bs_schedules")
     if bs_schedules:
         load_balance_schedules_backfill(bs_schedules, symbol)
 
     if _has_data(data.get("cash_flow")):
-        load_cashflow_from_screener(data["cash_flow"], symbol)
+        _company_id = data.get("company_id")          # int | None — set by fetch_screener_data
+        _consolidated = bool(data.get("consolidated", True))
+        load_cashflow_from_screener(
+            data["cash_flow"], symbol,
+            company_id=_company_id,
+            consolidated=_consolidated,
+        )
 
     if _has_data(data.get("ratios")):
         load_fundamentals_from_screener(data["ratios"], symbol)
@@ -1287,4 +1365,4 @@ def load_all_screener(data: dict, symbol: str):
         load_growth_from_screener(data["growth"], symbol)
 
     if _has_data(data.get("shareholding")):
-        load_ownership_history(data["shareholding"], symbol)
+        load_ownership_history(data["shareholding"], symbol)#1 time ctrl +z

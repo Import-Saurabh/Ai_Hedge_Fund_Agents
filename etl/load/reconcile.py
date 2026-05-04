@@ -138,46 +138,45 @@ def reconcile_balance_sheet(symbol: str, conn):
 # ─────────────────────────────────────────────
 # 2. CASH FLOW
 # ─────────────────────────────────────────────
-def reconcile_cash_flow(symbol: str, conn):
+# Inside reconcile.py, after _ensure_bs_extra_cols, add:
 
+def _ensure_cashflow_extra_cols(conn):
+    """Idempotently add completeness columns to cash_flow."""
+    for col_name, col_type in [
+        ("completeness_pct",    "REAL"),
+        ("missing_fields_json", "TEXT"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE cash_flow ADD COLUMN {col_name} {col_type}")
+            print(f"  db-migrate cash_flow: added missing column '{col_name}'")
+        except Exception:
+            pass
+
+# Then modify reconcile_cash_flow:
+
+def reconcile_cash_flow(symbol: str, conn):
+    _ensure_cashflow_extra_cols(conn)
+    conn.commit()
     rows = conn.execute("""
-        SELECT rowid,
-               operating_cash_flow,
-               investing_cash_flow,
-               financing_cash_flow,
-               free_cash_flow
+        SELECT rowid, cfo, free_cash_flow
         FROM cash_flow
         WHERE symbol = ?
     """, (symbol,)).fetchall()
 
-    for rowid, ocf, icf, fcf_stmt, fcf in rows:
-        ocf      = _f(ocf)
-        icf      = _f(icf)
-        fcf_stmt = _f(fcf_stmt)
-        fcf      = _f(fcf)
-
-        best_ocf = ocf
-        best_fcf = fcf
-
-        fields = {
-            "operating_cash_flow": ocf,
-            "free_cash_flow":      fcf,
-        }
-
-        comp, _ = _completeness(fields, list(fields.keys()))
-
+    for rowid, cfo, fcf in rows:
+        cfo = _f(cfo)
+        fcf = _f(fcf)
+        fields = {"cfo": cfo, "free_cash_flow": fcf}
+        comp, missing = _completeness(fields, list(fields.keys()))
         conn.execute("""
             UPDATE cash_flow SET
-                best_operating_cf   = ?,
-                best_free_cash_flow = ?,
-                completeness_pct    = ?
+                completeness_pct = ?,
+                missing_fields_json = ?
             WHERE rowid = ?
-        """, (best_ocf, best_fcf, comp, rowid))
+        """, (comp, json.dumps(missing), rowid))
 
     conn.commit()
     print(f"  ✅ reconcile cash_flow: {len(rows)} rows for {symbol}")
-
-
 # ─────────────────────────────────────────────
 # 3. INCOME STATEMENT
 # ─────────────────────────────────────────────

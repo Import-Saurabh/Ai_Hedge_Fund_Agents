@@ -170,7 +170,7 @@ def run_pipeline(symbol_yf: str = "ADANIPORTS.NS"):
     # load_balance(_safe_df(stmts.get("annual_bs")), symbol_nse, "annual", 0)
 
     # ✅ KEEP cashflow
-        load_cashflow(_safe_df(stmts.get("annual_cf")), symbol_nse, "annual")
+       # load_cashflow(_safe_df(stmts.get("annual_cf")), symbol_nse, "annual")
 
     # Quarterly
         q_inc = _safe_df(stmts.get("q_income"))

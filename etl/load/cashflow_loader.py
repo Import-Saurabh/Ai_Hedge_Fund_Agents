@@ -1,165 +1,355 @@
 """
-etl/load/cashflow_loader.py  v4.0
+etl/load/cashflow_loader.py  v6.0
 ────────────────────────────────────────────────────────────────
-Changes vs v3:
-  • Resolves best_operating_cf / best_free_cash_flow immediately
-    after yfinance data is written — does NOT wait for Screener
-  • completeness_pct computed and stored per row
-  • has_yf_detail flag set to 1 when yfinance columns populated
-  • Rows with zero useful yfinance data still inserted (scr_*
-    will fill them via screener_loader)
+Changes vs v5.0:
+  • Sub-category line items from Screener schedules are now fully
+    preserved in raw_details_json (every "Section > Sub Label" key).
+  • _ensure_cashflow_cols() runs at startup to defensively add any
+    columns that may be missing from older DB schemas (idempotent).
+  • load_cashflow() accepts BOTH:
+      – list[dict]  (from etl/extract/cashflow.py — existing path)
+      – pd.DataFrame (from cashflow_scrapper.py / screener_loader)
+    so it works regardless of caller.
+  • No yfinance dependency anywhere in this file.
+  • ON CONFLICT strategy unchanged:
+      – Core numerics use COALESCE (Screener value never overwritten
+        by NULL).
+      – raw_details_json is always replaced (latest fetch wins, so
+        newly scraped sub-items are always current).
+      – completeness_pct / missing_fields_json are recomputed on
+        every upsert.
 ────────────────────────────────────────────────────────────────
 """
 
+from __future__ import annotations
+
+import json
 import math
+from typing import Any, Dict, List, Optional, Union
+
 import pandas as pd
+
 from database.db import get_connection
-from database.validator import compute_completeness, log_data_quality
-
-_CR = 1e7
 
 
-def _cr(v) -> float | None:
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _f(v) -> Optional[float]:
+    """Safe float — returns None for NaN / Inf / None / unparseable."""
     if v is None:
         return None
     try:
         fv = float(v)
-        if math.isnan(fv) or math.isinf(fv):
-            return None
-        return round(fv / _CR, 2)
+        return None if (math.isnan(fv) or math.isinf(fv)) else fv
     except (TypeError, ValueError):
         return None
 
 
-def _col_val(s, *candidates):
-    for cand in candidates:
-        for idx in s.index:
-            if str(idx).lower().strip() == cand.lower().strip():
-                try:
-                    return float(s[idx])
-                except Exception:
-                    pass
-    for cand in candidates:
-        for idx in s.index:
-            if cand.lower() in str(idx).lower():
-                try:
-                    return float(s[idx])
-                except Exception:
-                    pass
-    return None
+def _json_or_none(obj: Any) -> Optional[str]:
+    """Serialise to JSON string, or return None if obj is empty/None."""
+    if obj is None:
+        return None
+    if isinstance(obj, str):
+        return obj if obj.strip() not in ("", "{}", "[]", "null") else None
+    try:
+        s = json.dumps(obj, default=str)
+        return s if s not in ("{}", "[]", "null") else None
+    except Exception:
+        return None
 
 
-def load_cashflow(df: pd.DataFrame, symbol: str, period_type: str):
-    """Load yfinance cash flow. Sets best_* = yfinance values initially;
-    screener_loader will override with Screener values (authoritative)."""
-    if df is None or df.empty:
-        print(f"  warn  cash_flow ({period_type}): empty — skipping")
+def _merge_raw_details(existing_json: Optional[str], new_obj: Any) -> Optional[str]:
+    """
+    Merge existing raw_details_json with new sub-item data.
+    New keys overwrite old; old keys not in new are preserved.
+    This way each load adds more detail rather than discarding prior data.
+    """
+    existing: Dict = {}
+    if existing_json:
+        try:
+            existing = json.loads(existing_json)
+        except Exception:
+            existing = {}
+
+    new: Dict = {}
+    if new_obj:
+        if isinstance(new_obj, str):
+            try:
+                new = json.loads(new_obj)
+            except Exception:
+                new = {}
+        elif isinstance(new_obj, dict):
+            new = new_obj
+
+    merged = {**existing, **new}   # new keys win
+    return _json_or_none(merged)
+
+
+def _completeness(fields: Dict[str, Any]) -> tuple[float, List[str]]:
+    """Return (completeness_pct, missing_field_names)."""
+    if not fields:
+        return 100.0, []
+    missing = [k for k, v in fields.items() if v is None]
+    pct = round((1 - len(missing) / len(fields)) * 100, 1)
+    return pct, missing
+
+
+# ── Schema migration ──────────────────────────────────────────────────────────
+
+def _ensure_cashflow_cols(conn) -> None:
+    """
+    Idempotently add any columns that might be absent from older DB schemas.
+    ALTER TABLE on an existing column raises an exception which we silently ignore.
+    """
+    extras = [
+        ("completeness_pct",    "REAL"),
+        ("missing_fields_json", "TEXT"),
+    ]
+    for col_name, col_type in extras:
+        try:
+            conn.execute(
+                f"ALTER TABLE cash_flow ADD COLUMN {col_name} {col_type}"
+            )
+            print(f"  db-migrate cash_flow: added column '{col_name}'")
+        except Exception:
+            pass   # already exists
+
+
+# ── DataFrame → list[dict] normaliser ────────────────────────────────────────
+
+def _df_to_records(df: pd.DataFrame, symbol: str) -> List[Dict]:
+    """
+    Convert a long-format DataFrame produced by cashflow_scrapper.py
+    (columns: Parent_Category, Sub-Category, <period cols>...)
+    into the same list[dict] format expected by the core upsert loop.
+
+    Each period column becomes one record. Sub-items for that period
+    across all Parent_Category rows are gathered into raw_details_json.
+    """
+    # Identify period columns (everything that isn't category labels)
+    non_period = {"Parent_Category", "Sub-Category"}
+    period_cols = [c for c in df.columns if c not in non_period]
+
+    if not period_cols:
+        print(f"  warn  cashflow_loader ({symbol}): DataFrame has no period columns")
+        return []
+
+    from etl.extract.cashflow import _period_to_iso   # reuse period parser
+
+    records: List[Dict] = []
+
+    for period_col in period_cols:
+        iso_date = _period_to_iso(period_col)
+        if not iso_date:
+            print(f"  warn  cashflow_loader: cannot parse period '{period_col}' — skip")
+            continue
+
+        # Build raw_details dict: "Section > Sub Label" → value
+        raw_detail: Dict[str, Any] = {}
+        for _, row in df.iterrows():
+            parent   = str(row.get("Parent_Category", "")).strip()
+            sub      = str(row.get("Sub-Category",    "")).strip()
+            val      = _f(row.get(period_col))
+            composite_key = f"{parent} > {sub}"
+            raw_detail[composite_key] = val
+
+        records.append({
+            "period_end":       iso_date,
+            "period_type":      "annual",
+            "cfo":              None,   # will be derived below
+            "cfi":              None,
+            "cff":              None,
+            "capex":            None,
+            "free_cash_flow":   None,
+            "net_cash_flow":    None,
+            "data_source":      "screener",
+            "raw_details_json": raw_detail,
+            "_df_source":       True,   # flag so totals are computed from raw
+        })
+
+    # For DataFrame-sourced records, try to pull totals from the sub-items
+    _TOTAL_LABELS = {
+        "Operating Activity": [
+            "cash from operating activity",
+            "net cash from operating activities",
+            "net cash provided by operating activities",
+        ],
+        "Investing Activity": [
+            "cash from investing activity",
+            "net cash from investing activities",
+            "net cash used in investing activities",
+        ],
+        "Financing Activity": [
+            "cash from financing activity",
+            "net cash from financing activities",
+            "net cash used in financing activities",
+        ],
+    }
+    _CAPEX_LABELS = [
+        "purchase of fixed assets",
+        "purchase of property plant and equipment",
+        "capital expenditure",
+        "capex",
+        "additions to fixed assets",
+    ]
+
+    for rec in records:
+        rd = rec["raw_details_json"]
+        if not isinstance(rd, dict):
+            continue
+
+        def _find(section: str, candidates: List[str]) -> Optional[float]:
+            prefix = section + " > "
+            for k, v in rd.items():
+                if k.startswith(prefix):
+                    label_lower = k[len(prefix):].lower().strip()
+                    for cand in candidates:
+                        if cand in label_lower:
+                            return _f(v)
+            return None
+
+        cfo   = _find("Operating Activity", _TOTAL_LABELS["Operating Activity"])
+        cfi   = _find("Investing Activity",  _TOTAL_LABELS["Investing Activity"])
+        cff   = _find("Financing Activity",  _TOTAL_LABELS["Financing Activity"])
+        capex = _find("Investing Activity",  _CAPEX_LABELS)
+
+        fcf: Optional[float] = None
+        if cfo is not None and capex is not None:
+            fcf = round(cfo + capex, 2)
+
+        ncf: Optional[float] = None
+        if cfo is not None and cfi is not None and cff is not None:
+            ncf = round(cfo + cfi + cff, 2)
+
+        rec.update(cfo=cfo, cfi=cfi, cff=cff, capex=capex,
+                   free_cash_flow=fcf, net_cash_flow=ncf)
+        rec["raw_details_json"] = _json_or_none(rd)
+
+    return records
+
+
+# ── Core upsert ───────────────────────────────────────────────────────────────
+
+def load_cashflow(
+    records: Union[List[Dict], pd.DataFrame],
+    symbol: str,
+) -> None:
+    """
+    Upsert cash flow data into the cash_flow table.
+
+    Parameters
+    ----------
+    records : list[dict]  OR  pd.DataFrame
+        • list[dict]  — output of etl.extract.cashflow.fetch_cashflow()
+          Each dict must have at minimum: period_end, period_type.
+        • pd.DataFrame — long-format output of cashflow_scrapper.py
+          (columns: Parent_Category, Sub-Category, <period cols>...)
+          The function normalises this automatically.
+
+    symbol : str
+        NSE ticker without exchange suffix (e.g. "ADANIPORTS").
+    """
+    # ── Normalise DataFrame input ─────────────────────────────────────────────
+    if isinstance(records, pd.DataFrame):
+        records = _df_to_records(records, symbol)
+
+    if not records:
+        print(f"  warn  cashflow_loader ({symbol}): no records — skipping")
         return
 
     conn  = get_connection()
-    count = 0
-    completeness_sum = 0.0
+    _ensure_cashflow_cols(conn)
 
-    for col in df.columns:
-        period_end = str(col)[:10]
-        s = df[col]
+    count   = 0
+    skipped = 0
 
-        def gcr(*names):
-            return _cr(_col_val(s, *names))
+    for rec in records:
+        period_end  = rec.get("period_end")
+        period_type = rec.get("period_type", "annual")
 
-        ocf  = gcr("Operating Cash Flow", "Net Cash Provided By Operating Activities")
-        icf  = gcr("Investing Cash Flow", "Net Cash Used For Investing Activities")
-        fcf_r = gcr("Financing Cash Flow", "Net Cash Used Provided By Financing Activities")
-        fcf  = gcr("Free Cash Flow")
+        if not period_end:
+            skipped += 1
+            continue
 
-        # has_yf_detail = 1 if at least OCF is present
-        has_detail = 1 if ocf is not None else 0
+        cfo   = _f(rec.get("cfo"))
+        cfi   = _f(rec.get("cfi"))
+        cff   = _f(rec.get("cff"))
+        capex = _f(rec.get("capex"))
+        fcf   = _f(rec.get("free_cash_flow"))
+        ncf   = _f(rec.get("net_cash_flow"))
 
-        row_dict = {
-            "best_operating_cf":  ocf,
-            "best_free_cash_flow": fcf,
+        # Derive FCF if not supplied but CFO + capex are available
+        if fcf is None and cfo is not None and capex is not None:
+            fcf = round(cfo + capex, 2)
+
+        # Derive net cash flow if all three sections are available
+        if ncf is None and cfo is not None and cfi is not None and cff is not None:
+            ncf = round(cfo + cfi + cff, 2)
+
+        # ── raw_details_json: merge with any existing DB value ────────────────
+        # Fetch current value so we can merge (add sub-items, never lose them)
+        existing_row = conn.execute(
+            "SELECT raw_details_json FROM cash_flow "
+            "WHERE symbol=? AND period_end=? AND period_type=?",
+            (symbol, period_end, period_type),
+        ).fetchone()
+        existing_raw = existing_row[0] if existing_row else None
+        new_raw      = rec.get("raw_details_json")
+        merged_raw   = _merge_raw_details(existing_raw, new_raw)
+
+        data_source = rec.get("data_source", "screener")
+
+        # ── Completeness ──────────────────────────────────────────────────────
+        core_fields = {
+            "cfo":            cfo,
+            "cfi":            cfi,
+            "cff":            cff,
+            "capex":          capex,
+            "free_cash_flow": fcf,
+            "net_cash_flow":  ncf,
         }
-        comp, _ = compute_completeness(row_dict, "cash_flow")
-        completeness_sum += comp
+        comp_pct, missing_fields = _completeness(core_fields)
 
         conn.execute("""
             INSERT INTO cash_flow (
                 symbol, period_end, period_type,
-                operating_cash_flow, net_income_ops, depreciation,
-                change_in_working_capital, change_in_receivables,
-                change_in_inventory, change_in_payables,
-                change_in_other_assets, change_in_other_liab,
-                other_non_cash_items, taxes_refund_paid,
-                investing_cash_flow, capex, purchase_of_ppe, sale_of_ppe,
-                purchase_of_business, sale_of_business,
-                purchase_of_investments, sale_of_investments,
-                interest_received, dividends_received, other_investing,
-                financing_cash_flow, net_debt_issuance,
-                long_term_debt_issuance, long_term_debt_payments,
-                short_term_debt_net, dividends_paid, interest_paid,
-                stock_issuance, other_financing,
-                free_cash_flow, beginning_cash, end_cash,
-                changes_in_cash,
-                best_operating_cf, best_investing_cf,
-                best_financing_cf, best_free_cash_flow,
-                is_interpolated, data_source, has_yf_detail, completeness_pct
+                cfo, cfi, cff,
+                capex, free_cash_flow, net_cash_flow,
+                raw_details_json, data_source,
+                completeness_pct, missing_fields_json
             ) VALUES (
-                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                ?, ?, ?,
+                ?, ?, ?,
+                ?, ?, ?,
+                ?, ?,
+                ?, ?
             )
             ON CONFLICT(symbol, period_end, period_type) DO UPDATE SET
-                operating_cash_flow=excluded.operating_cash_flow,
-                investing_cash_flow=excluded.investing_cash_flow,
-                financing_cash_flow=excluded.financing_cash_flow,
-                free_cash_flow=excluded.free_cash_flow,
-                best_operating_cf=COALESCE(best_operating_cf, excluded.best_operating_cf),
-                best_free_cash_flow=COALESCE(best_free_cash_flow, excluded.best_free_cash_flow),
-                has_yf_detail=excluded.has_yf_detail,
-                data_source=CASE WHEN data_source='screener' THEN 'both'
-                                 ELSE 'yfinance' END
+                cfo              = COALESCE(cash_flow.cfo,            excluded.cfo),
+                cfi              = COALESCE(cash_flow.cfi,            excluded.cfi),
+                cff              = COALESCE(cash_flow.cff,            excluded.cff),
+                capex            = COALESCE(cash_flow.capex,          excluded.capex),
+                free_cash_flow   = COALESCE(cash_flow.free_cash_flow, excluded.free_cash_flow),
+                net_cash_flow    = COALESCE(cash_flow.net_cash_flow,  excluded.net_cash_flow),
+                raw_details_json = excluded.raw_details_json,
+                data_source      = excluded.data_source,
+                completeness_pct    = excluded.completeness_pct,
+                missing_fields_json = excluded.missing_fields_json,
+                updated_at       = CURRENT_TIMESTAMP
         """, (
             symbol, period_end, period_type,
-            ocf,
-            gcr("Net Income From Continuing Operations", "Net Income Continuous Operations"),
-            gcr("Depreciation And Amortization", "Depreciation Amortization Depletion"),
-            gcr("Change In Working Capital"),
-            gcr("Change In Receivables"),
-            gcr("Change In Inventory"),
-            gcr("Change In Payable", "Change In Payables And Accrued Expense"),
-            gcr("Change In Other Current Assets"),
-            gcr("Change In Other Current Liabilities"),
-            gcr("Other Non Cash Items"),
-            gcr("Taxes Refunds Paid"),
-            icf,
-            gcr("Capital Expenditure"),
-            gcr("Purchase Of Ppe", "Purchases Of Property Plant And Equipment"),
-            gcr("Sale Of Ppe"),
-            gcr("Acquisition Of Business", "Purchase Of Business"),
-            gcr("Sale Of Business"),
-            gcr("Purchase Of Investment"),
-            gcr("Sale Of Investment"),
-            gcr("Interest Received Cfi"),
-            gcr("Dividends Received Cfi"),
-            gcr("Other Investing Activities"),
-            fcf_r,
-            gcr("Net Issuance Payments Of Debt", "Net Debt Issuance"),
-            gcr("Long Term Debt Issuance"),
-            gcr("Long Term Debt Payments", "Repayment Of Debt"),
-            gcr("Short Term Debt Net"),
-            gcr("Payment Of Dividends", "Common Stock Dividend Paid"),
-            gcr("Interest Paid Cff"),
-            gcr("Net Common Stock Issuance"),
-            gcr("Other Financing Activities"),
-            fcf,
-            gcr("Beginning Cash Position"),
-            gcr("End Cash Position"),
-            gcr("Changes In Cash"),
-            ocf, icf, fcf_r, fcf,   # best_* initial = yfinance
-            0, "yfinance", has_detail, round(comp, 1),
+            cfo, cfi, cff,
+            capex, fcf, ncf,
+            merged_raw, data_source,
+            comp_pct, json.dumps(missing_fields),
         ))
         count += 1
 
     conn.commit()
     conn.close()
-    avg = round(completeness_sum / count, 1) if count else 0
-    log_data_quality(symbol, "cash_flow", count, 0, avg, {}, "yfinance")
-    print(f"  ok  cash_flow ({period_type}): {count} rows | avg completeness {avg}%")
+
+    print(
+        f"  ok  cashflow_loader ({symbol}): "
+        f"{count} upserted"
+        + (f", {skipped} skipped (no period_end)" if skipped else "")
+    )
