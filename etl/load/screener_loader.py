@@ -1,11 +1,11 @@
 """
-etl/load/screener_loader.py  v5.4
+etl/load/screener_loader.py  v5.6
 ────────────────────────────────────────────────────────────────
-Changes vs v5.2:
-  • Removed columns receivables_over_6m, receivables_under_6m, prov_doubtful_debts
-    from balance_sheet table (no longer present in Screener's merged data).
-  • Fixed duplicate load_cashflow_from_screener() – only the new version remains.
-  • Added _ensure_cashflow_extra_cols() for completeness_pct / missing_fields_json.
+Changes vs v5.5:
+  FIX – raw_details_json no longer stores total/derived fields
+        (\"Operating Activity > Total\", \"Net Cash Flow\", \"Capex\", etc.).
+        Only the actual sub‑category line items are saved.
+  FIX – sub‑labels that match known total patterns are skipped.
 ────────────────────────────────────────────────────────────────
 """
 
@@ -34,21 +34,28 @@ _SCR_HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
+    "Accept":          "application/json, text/javascript, */*; q=0.01",
     "X-Requested-With": "XMLHttpRequest",
 }
 
-def _scr_get_json(url: str, retries: int = 3) -> Optional[dict]:
+
+def _scr_get_json(url: str, referer: str = "", retries: int = 3) -> Optional[dict]:
     """GET a Screener API URL, return parsed JSON dict or None."""
+    headers = dict(_SCR_HEADERS)
+    if referer:
+        headers["Referer"] = referer
     for attempt in range(retries):
         try:
             if _USE_HTTPX:
-                r = _httpx.get(url, headers=_SCR_HEADERS, follow_redirects=True, timeout=20)
+                r = _httpx.get(url, headers=headers, follow_redirects=True, timeout=20)
             else:
-                r = _requests.get(url, headers=_SCR_HEADERS, timeout=20)
+                r = _requests.get(url, headers=headers, timeout=20)
             if r.status_code == 200:
                 data = r.json()
-                return data if isinstance(data, dict) else None
+                if isinstance(data, dict) and data:
+                    return data
+                print(f"  warn  cf_schedules: empty response (dict but no keys) — {url}")
+                return None
             print(f"  warn  cf_schedules: HTTP {r.status_code} — {url}")
         except Exception as e:
             print(f"  warn  cf_schedules attempt {attempt+1}: {e}")
@@ -176,12 +183,8 @@ _BS_EXPECTED_ROWS = {
 # ── Balance sheet schema migration ───────────────────────────
 
 def _ensure_bs_columns(conn):
-    """
-    Add any missing columns to balance_sheet (idempotent).
-    Completeness columns are included. Removed obsolete receivable/prov columns.
-    """
+    """Add any missing columns to balance_sheet (idempotent)."""
     new_cols = [
-        # Sub-breakdown columns
         ("lt_borrowings",          "REAL"),
         ("st_borrowings",          "REAL"),
         ("lease_liabilities",      "REAL"),
@@ -196,7 +199,6 @@ def _ensure_bs_columns(conn):
         ("loans_advances",         "REAL"),
         ("other_asset_items",      "REAL"),
         ("net_debt",               "REAL"),
-        # Canonical columns
         ("equity_capital",         "REAL"),
         ("reserves",               "REAL"),
         ("borrowings",             "REAL"),
@@ -209,7 +211,6 @@ def _ensure_bs_columns(conn):
         ("cash_equivalents",       "REAL"),
         ("total_equity",           "REAL"),
         ("total_assets",           "REAL"),
-        # Completeness columns
         ("completeness_pct",       "REAL"),
         ("missing_fields_json",    "TEXT"),
     ]
@@ -401,24 +402,24 @@ def load_quarterly_results(df: pd.DataFrame, symbol: str):
                 data_source
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(symbol, period_end) DO UPDATE SET
-                sales              = excluded.sales,
-                expenses           = excluded.expenses,
-                operating_profit   = excluded.operating_profit,
-                opm_pct            = excluded.opm_pct,
-                other_income       = excluded.other_income,
-                interest           = excluded.interest,
-                depreciation       = excluded.depreciation,
-                profit_before_tax  = excluded.profit_before_tax,
-                tax_pct            = excluded.tax_pct,
-                net_profit         = excluded.net_profit,
-                eps                = excluded.eps,
-                data_source        = 'screener'
+                sales             = excluded.sales,
+                expenses          = excluded.expenses,
+                operating_profit  = excluded.operating_profit,
+                opm_pct           = excluded.opm_pct,
+                other_income      = excluded.other_income,
+                interest          = excluded.interest,
+                depreciation      = excluded.depreciation,
+                profit_before_tax = excluded.profit_before_tax,
+                tax_pct           = excluded.tax_pct,
+                net_profit        = excluded.net_profit,
+                eps               = excluded.eps,
+                data_source       = 'screener'
         """, (
             symbol, period_end,
             sales,
             _v(exp_r, col), _v(op_r, col), _v(opm_r, col),
             _v(oth_r, col), _v(int_r, col), _v(dep_r, col),
-            _v(pbt_r, col), _v(tax_r, col), _v(np_r, col),
+            _v(pbt_r, col), _v(tax_r, col), _v(np_r,  col),
             _v(eps_r, col),
             "screener",
         ))
@@ -451,13 +452,7 @@ def load_annual_results(df: pd.DataFrame, symbol: str):
     count = 0
 
     for col in df.columns:
-        col_str = str(col).strip()
-        if col_str.upper() == "TTM":
-            period_end = date.today().isoformat()
-            is_ttm = 1
-        else:
-            period_end = _parse_period(col_str)
-            is_ttm = 0
+        period_end = _parse_period(str(col))
         if not period_end:
             continue
 
@@ -471,46 +466,47 @@ def load_annual_results(df: pd.DataFrame, symbol: str):
                 sales, expenses, operating_profit, opm_pct,
                 other_income, interest, depreciation,
                 profit_before_tax, tax_pct, net_profit, eps,
-                dividend_payout_pct, is_ttm, data_source
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                dividend_payout_pct, data_source
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(symbol, period_end) DO UPDATE SET
-                sales                = excluded.sales,
-                expenses             = excluded.expenses,
-                operating_profit     = excluded.operating_profit,
-                opm_pct              = excluded.opm_pct,
-                other_income         = excluded.other_income,
-                interest             = excluded.interest,
-                depreciation         = excluded.depreciation,
-                profit_before_tax    = excluded.profit_before_tax,
-                tax_pct              = excluded.tax_pct,
-                net_profit           = excluded.net_profit,
-                eps                  = excluded.eps,
-                dividend_payout_pct  = excluded.dividend_payout_pct,
-                is_ttm               = excluded.is_ttm,
-                data_source          = 'screener'
+                sales               = excluded.sales,
+                expenses            = excluded.expenses,
+                operating_profit    = excluded.operating_profit,
+                opm_pct             = excluded.opm_pct,
+                other_income        = excluded.other_income,
+                interest            = excluded.interest,
+                depreciation        = excluded.depreciation,
+                profit_before_tax   = excluded.profit_before_tax,
+                tax_pct             = excluded.tax_pct,
+                net_profit          = excluded.net_profit,
+                eps                 = excluded.eps,
+                dividend_payout_pct = excluded.dividend_payout_pct,
+                data_source         = 'screener'
         """, (
             symbol, period_end,
             sales,
             _v(exp_r, col), _v(op_r, col), _v(opm_r, col),
             _v(oth_r, col), _v(int_r, col), _v(dep_r, col),
-            _v(pbt_r, col), _v(tax_r, col), _v(np_r, col),
+            _v(pbt_r, col), _v(tax_r, col), _v(np_r,  col),
             _v(eps_r, col), _v(div_r, col),
-            is_ttm, "screener",
+            "screener",
         ))
         count += 1
 
     conn.commit(); conn.close()
-    print(f"  ok  annual_results: {count} rows (incl TTM if present)")
+    ttm_flag = " (incl TTM if present)" if count > 10 else ""
+    print(f"  ok  annual_results: {count} rows{ttm_flag}")
 
 
-# ── Balance sheet diagnostic ──────────────────────────────────
+# ── BS diagnostic ─────────────────────────────────────────────
 
 def _print_bs_row_diagnostic(df: pd.DataFrame):
+    scraped_index_lower = [str(idx).lower().strip() for idx in df.index]
+
     print(f"\n  ── Balance Sheet Row Diagnostic ──────────────────────────")
     print(f"  {'Screener Label':<30} {'DB Column':<28} {'Found?'}")
     print(f"  {'-'*30} {'-'*28} {'-'*6}")
 
-    scraped_index_lower = [str(i).lower().strip() for i in df.index]
     missing_rows = []
 
     for label, col in _BS_EXPECTED_ROWS.items():
@@ -704,33 +700,85 @@ def load_balance_from_screener(df: pd.DataFrame, symbol: str):
     print(f"  ok  balance_sheet: {count} Screener rows upserted")
 
 
-# ── Cash flow (new flexible schema) ───────────────────────────
-
 # ── Cash flow schedule constants ─────────────────────────────────────────────
+
 _CF_SCHEDULE_PARENTS = [
     ("Operating Activity", "Cash+from+Operating+Activity"),
     ("Investing Activity", "Cash+from+Investing+Activity"),
     ("Financing Activity", "Cash+from+Financing+Activity"),
 ]
+
 _CF_TOTAL_LABELS = {
-    "Operating Activity": ["cash from operating activity",
-                           "net cash from operating activities",
-                           "net cash provided by operating activities",
-                           "total operating"],
-    "Investing Activity": ["cash from investing activity",
-                           "net cash from investing activities",
-                           "net cash used in investing activities",
-                           "total investing"],
-    "Financing Activity": ["cash from financing activity",
-                           "net cash from financing activities",
-                           "net cash used in financing activities",
-                           "total financing"],
+    "Operating Activity": [
+        "cash from operating activity",
+        "net cash from operating activities",
+        "net cash provided by operating activities",
+        "total operating",
+        "operating activity",
+        "cash from operations",
+    ],
+    "Investing Activity": [
+        "cash from investing activity",
+        "net cash from investing activities",
+        "net cash used in investing activities",
+        "total investing",
+        "investing activity",
+        "cash from investing",
+    ],
+    "Financing Activity": [
+        "cash from financing activity",
+        "net cash from financing activities",
+        "net cash used in financing activities",
+        "total financing",
+        "financing activity",
+        "cash from financing",
+    ],
 }
+
+_ALL_CF_TOTAL_LABELS = {lbl for lbls in _CF_TOTAL_LABELS.values() for lbl in lbls}
+
 _CAPEX_LABELS = [
     "fixed assets purchased", "purchase of fixed assets",
     "purchase of property plant and equipment",
     "capital expenditure", "capex", "additions to fixed assets",
 ]
+
+_CF_EXPECTED_SUB_LABELS = {
+    "Operating Activity": [
+        "Profit from operations",
+        "Receivables",
+        "Inventory",
+        "Payables",
+        "Loans Advances",
+        "Other WC items",
+        "Working capital changes",
+        "Direct taxes",
+    ],
+    "Investing Activity": [
+        "Fixed assets purchased",
+        "Fixed assets sold",
+        "Investments purchased",
+        "Investments sold",
+        "Interest received",
+        "Dividends received",
+        "Investment in group cos",
+        "Issue of shares on acq",
+        "Redemp n Canc of Shares",
+        "Acquisition of companies",
+        "Inter corporate deposits",
+        "Other investing items",
+    ],
+    "Financing Activity": [
+        "Proceeds from shares",
+        "Redemption of debentures",
+        "Proceeds from borrowings",
+        "Repayment of borrowings",
+        "Interest paid fin",
+        "Dividends paid",
+        "Financial liabilities",
+        "Other financing items",
+    ],
+}
 
 
 def _cf_clean(text) -> Optional[float]:
@@ -748,14 +796,50 @@ def _cf_clean(text) -> Optional[float]:
 
 
 def _cf_lk(label) -> str:
-    return str(label).lower().strip()
+    return " ".join(str(label).lower().split())
+
+
+def _cf_is_total_label(label: str) -> bool:
+    """Return True if this label is a section-total row (not a component)."""
+    lk = _cf_lk(label)
+    if lk in _ALL_CF_TOTAL_LABELS:
+        return True
+    for tl in _ALL_CF_TOTAL_LABELS:
+        if tl in lk:
+            return True
+    return False
 
 
 def _cf_find_total(sub_items: dict, section: str) -> Optional[float]:
+    """
+    Find section total from sub-items dict.
+    Priority: exact match → soft match → sum of non-total items.
+    Never sums the total row itself.
+    """
+    # 1. Exact match
     for cand in _CF_TOTAL_LABELS.get(section, []):
         for lbl, val in sub_items.items():
-            if _cf_lk(lbl) == cand or cand in _cf_lk(lbl):
-                return _cf_clean(val)
+            if _cf_lk(lbl) == cand:
+                v = _cf_clean(val)
+                if v is not None:
+                    return v
+
+    # 2. Soft match
+    for cand in _CF_TOTAL_LABELS.get(section, []):
+        for lbl, val in sub_items.items():
+            if cand in _cf_lk(lbl):
+                v = _cf_clean(val)
+                if v is not None:
+                    return v
+
+    # 3. Sum components only (exclude any total-row labels)
+    components = [
+        _cf_clean(v) for lbl, v in sub_items.items()
+        if not _cf_is_total_label(lbl) and _cf_clean(v) is not None
+    ]
+    if components:
+        return round(sum(components), 2)
+
     return None
 
 
@@ -767,32 +851,76 @@ def _cf_find_capex(inv_sub: dict) -> Optional[float]:
     return None
 
 
-def _fetch_cf_schedules(company_id: int, consolidated: bool) -> dict:
-    """Fetch Operating/Investing/Financing sub-items from Screener schedules API."""
+def _fetch_cf_schedules(company_id: int, consolidated: bool, symbol_nse: str) -> dict:
+    """
+    Fetch Operating/Investing/Financing sub-items from Screener schedules API.
+    Returns { section_name: { period_label: { sub_label: float } } }
+    """
     result = {}
     cons = "" if consolidated else "false"
+    referer = (
+        f"https://www.screener.in/company/{symbol_nse}/"
+        f"{'consolidated' if consolidated else ''}/"
+    )
+
     for section_name, parent_param in _CF_SCHEDULE_PARENTS:
         url = (
             f"https://www.screener.in/api/company/{company_id}/schedules/"
             f"?parent={parent_param}&section=cash-flow&consolidated={cons}"
         )
-        raw = _scr_get_json(url)
+        print(f"  cf_schedule [{section_name}] → {url}")
+        raw = _scr_get_json(url, referer=referer)
         _time.sleep(0.4)
-        if raw and isinstance(raw, dict):
-            parsed = {}
-            for period_label, sub_items in raw.items():
-                if not isinstance(sub_items, dict):
-                    continue
-                cleaned = {str(k).strip(): _cf_clean(v) for k, v in sub_items.items()}
-                parsed[str(period_label).strip()] = cleaned
-            result[section_name] = parsed
-            sample = sorted(next(iter(parsed.values()), {}).keys())
-            print(f"  ok  cf_schedule [{section_name}]: {len(parsed)} periods  sub-items: {sample}")
-        else:
+
+        if not raw or not isinstance(raw, dict):
             result[section_name] = {}
             print(f"  warn  cf_schedule [{section_name}]: no data from API")
+            continue
+
+        parsed: dict = {}
+        raw_sub_labels = []
+
+        for sub_label, period_values in raw.items():
+            sub_key = str(sub_label).strip()
+            if not isinstance(period_values, dict):
+                print(f"  warn  cf_schedule [{section_name}]: "
+                      f"sub_label '{sub_key}' has non-dict value — skipped")
+                continue
+            raw_sub_labels.append(sub_key)
+
+            for period_label, value in period_values.items():
+                period_key = str(period_label).strip()
+                if not _parse_period(period_key):
+                    continue
+                if period_key not in parsed:
+                    parsed[period_key] = {}
+                cleaned = _cf_clean(value)
+                parsed[period_key][sub_key] = cleaned
+
+        result[section_name] = parsed
+
+        n_periods   = len(parsed)
+        sample_subs = raw_sub_labels[:20]
+        print(f"  ok  cf_schedule [{section_name}]: "
+              f"{n_periods} periods, {len(raw_sub_labels)} sub-labels")
+        print(f"       sub-labels found: {sample_subs}")
+
+        expected = _CF_EXPECTED_SUB_LABELS.get(section_name, [])
+        missing_subs = []
+        for exp_lbl in expected:
+            found = any(exp_lbl.lower() in sl.lower() for sl in raw_sub_labels)
+            if not found:
+                missing_subs.append(exp_lbl)
+        if missing_subs:
+            print(f"  warn  cf_schedule [{section_name}] — "
+                  f"{len(missing_subs)} expected sub-labels not found: {missing_subs}")
+        else:
+            print(f"  ✅  cf_schedule [{section_name}] — all {len(expected)} expected sub-labels found")
+
     return result
 
+
+# ── Cash flow from Screener (main loader) ─────────────────────
 
 def load_cashflow_from_screener(df: pd.DataFrame, symbol: str,
                                  company_id: Optional[int] = None,
@@ -801,91 +929,115 @@ def load_cashflow_from_screener(df: pd.DataFrame, symbol: str,
     Load Screener cash flow data into cash_flow table.
 
     Phase 1 — top-level HTML table (df): cfo / cfi / cff / ncf totals.
-    Phase 2 — schedules API (same endpoint as cashflow_scrapper.py):
-              all sub-category line items; capex from Investing subs.
+    Phase 2 — schedules API: sub-category line items stored in
+              raw_details_json as "Section > Sub Label" keys.
+              capex from Investing > Fixed assets purchased.
+              free_cash_flow derived as cfo + capex.
+              net_cash_flow derived as cfo + cfi + cff when missing.
 
-    All sub-items stored in raw_details_json as "Section > Sub Label" keys.
-    capex → free_cash_flow derived as cfo + capex.
-    net_cash_flow derived as cfo + cfi + cff when missing.
+    v5.6: raw_details_json only contains the actual sub-items,
+          no totals or derived fields.
     """
     if not _has_data(df):
         print("  warn  cash_flow screener: no data")
         return
 
-    # Phase 1: top-level rows from Screener HTML table
     ocf_row  = _row(df, "Cash from Operating Activity")
     icf_row  = _row(df, "Cash from Investing Activity")
     fcf_row  = _row(df, "Cash from Financing Activity")
     ncf_row  = _row(df, "Net Cash Flow")
     fcf2_row = _row(df, "Free Cash Flow")
 
-    # Phase 2: sub-items via schedules API (mirrors cashflow_scrapper.py)
+    print(f"\n  ── CF Phase 1: top-level HTML rows ──────────────────────")
+    print(f"  Cash from Operating Activity  {'✅ found' if ocf_row is not None else '❌ NOT FOUND'}")
+    print(f"  Cash from Investing Activity  {'✅ found' if icf_row is not None else '❌ NOT FOUND'}")
+    print(f"  Cash from Financing Activity  {'✅ found' if fcf_row is not None else '❌ NOT FOUND'}")
+    print(f"  Net Cash Flow                 {'✅ found' if ncf_row is not None else '❌ NOT FOUND'}")
+    print(f"  Free Cash Flow                {'✅ found' if fcf2_row is not None else '❌ NOT FOUND'}")
+    print(f"  HTML table index labels: {list(df.index)}")
+    print(f"  HTML table period cols:  {list(df.columns)}")
+
     schedules: dict = {}
     if company_id:
-        print(f"  ok  cf_schedules: fetching sub-items for company_id={company_id} ...")
-        schedules = _fetch_cf_schedules(company_id, consolidated)
+        print(f"\n  ── CF Phase 2: schedules API (company_id={company_id}) ─────────")
+        schedules = _fetch_cf_schedules(company_id, consolidated, symbol)
     else:
         print("  warn  cf_schedules: no company_id — sub-items will be empty")
 
+    for sec_name, sec_data in schedules.items():
+        sample_period = next(iter(sec_data), None)
+        if sample_period:
+            sub_labels = list(sec_data[sample_period].keys())
+            print(f"  cf_schedule [{sec_name}] sample period '{sample_period}': "
+                  f"{len(sub_labels)} sub-labels → {sub_labels[:8]}{'...' if len(sub_labels) > 8 else ''}")
+        else:
+            print(f"  warn  cf_schedule [{sec_name}]: 0 periods parsed")
+
     conn  = get_connection()
     count = 0
+    total_sub_items_written = 0
 
     for col in df.columns:
-        period_end = _parse_period(str(col))
+        col_str    = str(col).strip()
+        period_end = _parse_period(col_str)
         if not period_end:
             continue
 
-        # Phase 1 values
         cfo = _v(ocf_row,  col)
         cfi = _v(icf_row,  col)
         cff = _v(fcf_row,  col)
         ncf = _v(ncf_row,  col)
         fcf = _v(fcf2_row, col)
 
-        # Phase 2: sub-items for this period
-        col_str   = str(col).strip()
         ops_items = schedules.get("Operating Activity", {}).get(col_str, {})
-        inv_items = schedules.get("Investing Activity", {}).get(col_str, {})
-        fin_items = schedules.get("Financing Activity", {}).get(col_str, {})
+        inv_items = schedules.get("Investing Activity",  {}).get(col_str, {})
+        fin_items = schedules.get("Financing Activity",  {}).get(col_str, {})
 
-        # Fill totals from schedules where top-level was None
-        if cfo is None: cfo = _cf_find_total(ops_items, "Operating Activity")
-        if cfi is None: cfi = _cf_find_total(inv_items, "Investing Activity")
-        if cff is None: cff = _cf_find_total(fin_items, "Financing Activity")
+        if count < 3:
+            print(f"  cf_period '{col_str}': "
+                  f"ops={len(ops_items)} inv={len(inv_items)} fin={len(fin_items)} sub-items")
+            if not ops_items and not inv_items and not fin_items:
+                all_period_keys = set()
+                for sec_data in schedules.values():
+                    all_period_keys.update(sec_data.keys())
+                print(f"  debug  available period keys in schedules: "
+                      f"{sorted(all_period_keys)[:10]}")
 
-        # Capex from Investing > Fixed assets purchased
+        if cfo is None:
+            cfo = _cf_find_total(ops_items, "Operating Activity")
+        if cfi is None:
+            cfi = _cf_find_total(inv_items, "Investing Activity")
+        if cff is None:
+            cff = _cf_find_total(fin_items, "Financing Activity")
+
         capex = _cf_find_capex(inv_items)
 
-        # Derived metrics
-        if fcf is None and cfo is not None and capex is not None:
-            fcf = round(cfo + capex, 2)
+        screener_fcf = round(cfo + capex, 2) if (cfo is not None and capex is not None) else fcf
         if ncf is None and cfo is not None and cfi is not None and cff is not None:
             ncf = round(cfo + cfi + cff, 2)
 
-        if cfo is None and fcf is None:
+        if cfo is None and screener_fcf is None:
+            print(f"  skip  cf[{col_str}]: cfo and fcf both None — no usable data")
             continue
 
-        # Build raw_details_json: parent totals + ALL sub-items
+        # ── Build raw_details_json (ONLY sub‑items) ────────────────────────
         raw_detail: dict = {}
-        if cfo   is not None: raw_detail["Operating Activity > Total"] = cfo
-        if cfi   is not None: raw_detail["Investing Activity > Total"] = cfi
-        if cff   is not None: raw_detail["Financing Activity > Total"] = cff
-        if ncf   is not None: raw_detail["Net Cash Flow"]              = ncf
-        if fcf   is not None: raw_detail["Free Cash Flow"]             = fcf
-        if capex is not None: raw_detail["Capex"]                      = capex
-        for sec, sub_items in [("Operating Activity", ops_items),
-                                ("Investing Activity", inv_items),
-                                ("Financing Activity", fin_items)]:
+
+        for sec_name, sub_items in [
+            ("Operating Activity", ops_items),
+            ("Investing Activity",  inv_items),
+            ("Financing Activity",  fin_items),
+        ]:
             for sub_label, val in sub_items.items():
-                raw_detail[f"{sec} > {sub_label}"] = val
+                # skip section‑total rows, we don't want them in raw details
+                if _cf_is_total_label(sub_label):
+                    continue
+                raw_detail[f"{sec_name} > {sub_label}"] = val
+
+        sub_item_count = len(raw_detail)
+        total_sub_items_written += sub_item_count
 
         raw_json = json.dumps(raw_detail, default=str) if raw_detail else None
-
-        # Re-derive FCF from Screener capex so it stays internally consistent.
-        # Screener "Fixed assets purchased" = gross capex (purchases only).
-        # yfinance CapitalExpenditures = net capex (purchases minus proceeds) → too negative.
-        # Always use Screener's capex+CFO to compute FCF when both are available.
-        screener_fcf = round(cfo + capex, 2) if (cfo is not None and capex is not None) else fcf
 
         conn.execute("""
             INSERT INTO cash_flow (
@@ -912,7 +1064,7 @@ def load_cashflow_from_screener(df: pd.DataFrame, symbol: str,
 
     conn.commit()
 
-    # ── Task 2: Diagnostic logging (mirrors balance-sheet diagnostic block) ──
+    # ── Diagnostic (unchanged, shows sub‑items only) ─────────────────
     latest = conn.execute("""
         SELECT cfo, cfi, cff, capex, free_cash_flow, net_cash_flow, raw_details_json
         FROM cash_flow WHERE symbol = ?
@@ -931,7 +1083,6 @@ def load_cashflow_from_screener(df: pd.DataFrame, symbol: str,
     if latest:
         s_cfo, s_cfi, s_cff, s_capex, s_fcf, s_ncf, s_raw = latest
 
-        # Core columns
         _diag("Cash from Operating Activity", "cfo",            s_cfo)
         _diag("Cash from Investing Activity", "cfi",            s_cfi)
         _diag("Cash from Financing Activity", "cff",            s_cff)
@@ -939,32 +1090,35 @@ def load_cashflow_from_screener(df: pd.DataFrame, symbol: str,
         _diag("Free Cash Flow (cfo+capex)",   "free_cash_flow", s_fcf)
         _diag("Net Cash Flow",                "net_cash_flow",  s_ncf)
 
-        # Sub-item checks from raw_details_json
         sub_count = 0
+        all_raw_keys = []
         if s_raw:
             try:
                 raw = json.loads(s_raw)
-                sub_checks = [
-                    ("Operating Activity > Profit from operations",   "raw: op_profit_ops"),
-                    ("Operating Activity > Working capital changes",   "raw: op_wc_changes"),
-                    ("Operating Activity > Direct taxes",              "raw: op_direct_taxes"),
-                    ("Investing Activity > Fixed assets purchased",    "raw: inv_fa_purchased"),
-                    ("Investing Activity > Fixed assets sold",         "raw: inv_fa_sold"),
-                    ("Investing Activity > Investments purchased",     "raw: inv_invest_purch"),
-                    ("Investing Activity > Interest received",         "raw: inv_interest_recv"),
-                    ("Investing Activity > Acquisition of companies",  "raw: inv_acquisition"),
-                    ("Financing Activity > Proceeds from borrowings",  "raw: fin_proc_borrow"),
-                    ("Financing Activity > Repayment of borrowings",   "raw: fin_repay_borrow"),
-                    ("Financing Activity > Interest paid fin",         "raw: fin_interest_paid"),
-                    ("Financing Activity > Dividends paid",            "raw: fin_dividends"),
-                ]
-                for raw_key, db_col in sub_checks:
-                    _diag(raw_key[:35], db_col, raw.get(raw_key))
-                sub_count = sum(1 for k in raw if ">" in k and "> Total" not in k)
-            except Exception:
-                pass
+                all_raw_keys = list(raw.keys())
 
-        print(f"  {'─'*72}")
+                print(f"\n  ── Sub-item checks (raw_details_json) ──────────────────────────────────")
+                for section_name, expected_subs in _CF_EXPECTED_SUB_LABELS.items():
+                    for exp_sub in expected_subs:
+                        full_key = f"{section_name} > {exp_sub}"
+                        matched_key = None
+                        matched_val = None
+                        for k, v in raw.items():
+                            if k == full_key or (
+                                k.startswith(section_name + " > ") and
+                                exp_sub.lower() in k.lower()
+                            ):
+                                matched_key = k
+                                matched_val = v
+                                break
+                        status = f"✅ {matched_val}" if matched_val is not None else "❌ NULL"
+                        print(f"  {full_key[:65]:<65} {status}")
+
+                sub_count = len(all_raw_keys)
+            except Exception as e:
+                print(f"  warn  cf diagnostic JSON parse error: {e}")
+
+        print(f"\n  ── Summary ──────────────────────────────────────────────────────────────")
         core_null = [f for f, v in [
             ("cfo", s_cfo), ("cfi", s_cfi), ("cff", s_cff),
             ("capex", s_capex), ("free_cash_flow", s_fcf), ("net_cash_flow", s_ncf),
@@ -972,8 +1126,9 @@ def load_cashflow_from_screener(df: pd.DataFrame, symbol: str,
         if core_null:
             print(f"  ⚠️  Missing core fields (latest period): {core_null}")
         else:
-            print(f"  ✅ All {6} core cash flow fields populated (latest period)")
+            print(f"  ✅ All 6 core cash flow fields populated (latest period)")
         print(f"  📦 Sub-items stored in raw_details_json: {sub_count}")
+        print(f"  📝 All raw_details keys ({len(all_raw_keys)}): {all_raw_keys}")
     else:
         print("  ⚠️  No cash_flow rows found for diagnostic")
 
@@ -981,20 +1136,152 @@ def load_cashflow_from_screener(df: pd.DataFrame, symbol: str,
     print()
 
     conn.close()
-    print(f"  ok  cash_flow: {count} Screener rows upserted (periods with data)")
+    print(f"  ok  cash_flow: {count} Screener rows upserted (periods with data) | "
+          f"total sub-items written: {total_sub_items_written}")
+
+
+# ── Balance sheet schedules backfill (unchanged) ──────────────────────────
+# (rest of the file remains identical)
+# ── Balance sheet schedules backfill ──────────────────────────
+
+_SCHEDULE_COL_MAP = {
+    "Long term Borrowings":    "lt_borrowings",
+    "Short term Borrowings":   "st_borrowings",
+    "Lease Liabilities":       "lease_liabilities",
+    "Preference Capital":      "preference_capital",
+    "Other Borrowings":        "other_borrowings",
+    "Non controlling int":     "minority_interest",
+    "Trade Payables":          "trade_payables",
+    "Advance from Customers":  "advance_from_customers",
+    "Other liability items":   "other_liability_items",
+    "Inventories":             "inventories",
+    "Trade receivables":       "trade_receivables",
+    "Cash Equivalents":        "cash_equivalents",
+    "Loans n Advances":        "loans_advances",
+}
+
+_SCHED_LABEL_MAP = [
+    (["long term borrowing"],          "Long term Borrowings"),
+    (["short term borrowing"],         "Short term Borrowings"),
+    (["lease liabilit"],               "Lease Liabilities"),
+    (["preference capital"],           "Preference Capital"),
+    (["other borrowing"],              "Other Borrowings"),
+    (["non controlling", "minority interest", "non-controlling"], "Non controlling int"),
+    (["trade payable"],                "Trade Payables"),
+    (["advance from customer"],        "Advance from Customers"),
+    (["inventor"],                     "Inventories"),
+    (["trade receivable", "debtors", "sundry debtor"], "Trade receivables"),
+    (["cash equivalent", "cash & equiv", "cash and bank", "cash and equiv",
+      "cash in hand", "bank balance", "cash & bank", "cash at bank", "balance with bank"], "Cash Equivalents"),
+    (["loan", "advance"],              "Loans n Advances"),
+]
+
+def _sched_canonical(sub_label: str) -> Optional[str]:
+    n = str(sub_label).lower().strip()
+    for patterns, canonical in _SCHED_LABEL_MAP:
+        if any(p in n for p in patterns):
+            return canonical
+    return None
+
+def load_balance_schedules_backfill(schedules: dict, symbol: str):
+    if not schedules:
+        print("  skip  bs_backfill: no schedules data")
+        return
+
+    conn = get_connection()
+    _ensure_bs_columns(conn)
+    conn.commit()
+
+    backfilled = 0
+    for parent_name, period_data in schedules.items():
+        for period_label, sub_dict in period_data.items():
+            period_end = _parse_period(str(period_label).strip())
+            if not period_end:
+                continue
+
+            mon = str(period_label).strip()[:3].lower()
+            period_type = "annual" if mon == "mar" else (
+                "half_year" if mon in ("sep", "oct", "nov", "dec", "jan", "feb") else "annual"
+            )
+
+            exists = conn.execute(
+                "SELECT rowid FROM balance_sheet WHERE symbol=? AND period_end=? AND period_type=?",
+                (symbol, period_end, period_type)
+            ).fetchone()
+            if not exists:
+                continue
+
+            col_vals = {}
+            for sub_label, value in sub_dict.items():
+                canonical = _sched_canonical(sub_label)
+                if canonical is None:
+                    continue
+                db_col = _SCHEDULE_COL_MAP.get(canonical)
+                if db_col is None:
+                    continue
+                fv = _safe_float(value)
+                if fv is None:
+                    continue
+                col_vals[db_col] = round(col_vals.get(db_col, 0.0) + fv, 4)
+
+            if not col_vals:
+                continue
+
+            set_parts = [f"{col} = COALESCE({col}, ?)" for col in col_vals]
+            vals = list(col_vals.values())
+            vals.extend([symbol, period_end, period_type])
+            conn.execute(
+                f"UPDATE balance_sheet SET {', '.join(set_parts)} "
+                f"WHERE symbol=? AND period_end=? AND period_type=?",
+                vals
+            )
+            backfilled += len(col_vals)
+
+    rows = conn.execute(
+        "SELECT period_end, period_type FROM balance_sheet WHERE symbol=?",
+        (symbol,)
+    ).fetchall()
+    for period_end, period_type in rows:
+        _bs_completeness(conn, symbol, period_end, period_type)
+
+    conn.commit()
+    conn.close()
+
+    _backfill_net_debt(symbol)
+    print(f"  ok  bs_backfill: {backfilled} sub-cells backfilled for {symbol} "
+          f"(COALESCE — existing data preserved)")
+
+def _backfill_net_debt(symbol: str):
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT rowid, borrowings, cash_equivalents
+        FROM balance_sheet
+        WHERE symbol=? AND net_debt IS NULL
+    """, (symbol,)).fetchall()
+
+    updated = 0
+    for rowid, bor, cash in rows:
+        b = _safe_float(bor)
+        c = _safe_float(cash)
+        if b is not None and c is not None:
+            conn.execute(
+                "UPDATE balance_sheet SET net_debt=? WHERE rowid=?",
+                (round(b - c, 2), rowid)
+            )
+            updated += 1
+
+    conn.commit()
+    conn.close()
+    if updated:
+        print(f"  ok  bs_backfill: net_debt recomputed for {updated} row(s)")
 
 
 # ── Growth metrics ────────────────────────────────────────────
 
-# ── Task 3: Ensure UNIQUE index on growth_metrics(symbol, as_of_date) ────────
-
 def _ensure_growth_metrics_unique(conn) -> None:
     """
     Create UNIQUE INDEX on growth_metrics(symbol, as_of_date) if it doesn't
-    exist yet.  This makes the ON CONFLICT(symbol, as_of_date) clause in
-    etl/load/growth_loader.py (yfinance path) valid and stops the error:
-        "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"
-    Safe to call repeatedly — idempotent.
+    exist yet. Safe to call repeatedly — idempotent.
     """
     try:
         conn.execute("""
@@ -1049,7 +1336,7 @@ def load_growth_from_screener(df: pd.DataFrame, symbol: str):
 
     today = date.today().isoformat()
     conn  = get_connection()
-    _ensure_growth_metrics_unique(conn)   # Task 3: ensure UNIQUE index exists
+    _ensure_growth_metrics_unique(conn)
     conn.execute("""
         INSERT INTO growth_metrics (symbol, as_of_date,
             scr_sales_cagr_10y, scr_sales_cagr_5y, scr_sales_cagr_3y, scr_sales_ttm,
@@ -1197,139 +1484,6 @@ def load_ownership_history(df: pd.DataFrame, symbol: str):
     print(f"  ok  ownership_history: {count} quarterly rows (skip={skipped})")
 
 
-# ── Balance sheet schedules backfill ──────────────────────────
-
-_SCHEDULE_COL_MAP = {
-    "Long term Borrowings":    "lt_borrowings",
-    "Short term Borrowings":   "st_borrowings",
-    "Lease Liabilities":       "lease_liabilities",
-    "Preference Capital":      "preference_capital",
-    "Other Borrowings":        "other_borrowings",
-    "Non controlling int":     "minority_interest",
-    "Trade Payables":          "trade_payables",
-    "Advance from Customers":  "advance_from_customers",
-    "Other liability items":   "other_liability_items",
-    "Inventories":             "inventories",
-    "Trade receivables":       "trade_receivables",
-    "Cash Equivalents":        "cash_equivalents",
-    "Loans n Advances":        "loans_advances",
-}
-
-_SCHED_LABEL_MAP = [
-    (["long term borrowing"],          "Long term Borrowings"),
-    (["short term borrowing"],         "Short term Borrowings"),
-    (["lease liabilit"],               "Lease Liabilities"),
-    (["preference capital"],           "Preference Capital"),
-    (["other borrowing"],              "Other Borrowings"),
-    (["non controlling", "minority interest", "non-controlling"], "Non controlling int"),
-    (["trade payable"],                "Trade Payables"),
-    (["advance from customer"],        "Advance from Customers"),
-    (["inventor"],                     "Inventories"),
-    (["trade receivable", "debtors", "sundry debtor"], "Trade receivables"),
-    (["cash equivalent", "cash & equiv", "cash and bank", "cash and equiv",
-      "cash in hand", "bank balance", "cash & bank", "cash at bank", "balance with bank"], "Cash Equivalents"),
-    (["loan", "advance"],              "Loans n Advances"),
-]
-
-def _sched_canonical(sub_label: str) -> Optional[str]:
-    n = str(sub_label).lower().strip()
-    for patterns, canonical in _SCHED_LABEL_MAP:
-        if any(p in n for p in patterns):
-            return canonical
-    return None
-
-def load_balance_schedules_backfill(schedules: dict, symbol: str):
-    if not schedules:
-        print("  skip  bs_backfill: no schedules data")
-        return
-
-    conn = get_connection()
-    _ensure_bs_columns(conn)
-    conn.commit()
-
-    backfilled = 0
-    for parent_name, period_data in schedules.items():
-        for period_label, sub_dict in period_data.items():
-            period_end = _parse_period(str(period_label).strip())
-            if not period_end:
-                continue
-
-            mon = str(period_label).strip()[:3].lower()
-            period_type = "annual" if mon == "mar" else (
-                "half_year" if mon in ("sep", "oct", "nov", "dec", "jan", "feb") else "annual"
-            )
-
-            exists = conn.execute(
-                "SELECT rowid FROM balance_sheet WHERE symbol=? AND period_end=? AND period_type=?",
-                (symbol, period_end, period_type)
-            ).fetchone()
-            if not exists:
-                continue
-
-            col_vals = {}
-            for sub_label, value in sub_dict.items():
-                canonical = _sched_canonical(sub_label)
-                if canonical is None:
-                    continue
-                db_col = _SCHEDULE_COL_MAP.get(canonical)
-                if db_col is None:
-                    continue
-                fv = _safe_float(value)
-                if fv is None:
-                    continue
-                col_vals[db_col] = round(col_vals.get(db_col, 0.0) + fv, 4)
-
-            if not col_vals:
-                continue
-
-            set_parts = [f"{col} = COALESCE({col}, ?)" for col in col_vals]
-            vals = list(col_vals.values())
-            vals.extend([symbol, period_end, period_type])
-            conn.execute(
-                f"UPDATE balance_sheet SET {', '.join(set_parts)} "
-                f"WHERE symbol=? AND period_end=? AND period_type=?",
-                vals
-            )
-            backfilled += len(col_vals)
-
-    rows = conn.execute(
-        "SELECT period_end, period_type FROM balance_sheet WHERE symbol=?",
-        (symbol,)
-    ).fetchall()
-    for period_end, period_type in rows:
-        _bs_completeness(conn, symbol, period_end, period_type)
-
-    conn.commit()
-    conn.close()
-
-    _backfill_net_debt(symbol)
-    print(f"  ok  bs_backfill: {backfilled} sub-cells backfilled for {symbol} (COALESCE — existing data preserved)")
-
-def _backfill_net_debt(symbol: str):
-    conn = get_connection()
-    rows = conn.execute("""
-        SELECT rowid, borrowings, cash_equivalents
-        FROM balance_sheet
-        WHERE symbol=? AND net_debt IS NULL
-    """, (symbol,)).fetchall()
-
-    updated = 0
-    for rowid, bor, cash in rows:
-        b = _safe_float(bor)
-        c = _safe_float(cash)
-        if b is not None and c is not None:
-            conn.execute(
-                "UPDATE balance_sheet SET net_debt=? WHERE rowid=?",
-                (round(b - c, 2), rowid)
-            )
-            updated += 1
-
-    conn.commit()
-    conn.close()
-    if updated:
-        print(f"  ok  bs_backfill: net_debt recomputed for {updated} row(s)")
-
-
 # ── Master dispatcher ─────────────────────────────────────────
 
 def load_all_screener(data: dict, symbol: str):
@@ -1350,7 +1504,7 @@ def load_all_screener(data: dict, symbol: str):
         load_balance_schedules_backfill(bs_schedules, symbol)
 
     if _has_data(data.get("cash_flow")):
-        _company_id = data.get("company_id")          # int | None — set by fetch_screener_data
+        _company_id  = data.get("company_id")
         _consolidated = bool(data.get("consolidated", True))
         load_cashflow_from_screener(
             data["cash_flow"], symbol,
@@ -1365,4 +1519,4 @@ def load_all_screener(data: dict, symbol: str):
         load_growth_from_screener(data["growth"], symbol)
 
     if _has_data(data.get("shareholding")):
-        load_ownership_history(data["shareholding"], symbol)#1 time ctrl +z
+        load_ownership_history(data["shareholding"], symbol)

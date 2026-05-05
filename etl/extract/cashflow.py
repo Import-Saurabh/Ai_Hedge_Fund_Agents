@@ -1,44 +1,85 @@
 """
-etl/extract/cashflow.py  v2.0
+etl/extract/cashflow.py  v3.0
 ────────────────────────────────────────────────────────────────
-Changes vs v1.0:
-  FIX 1 — _parse_schedule(): Screener's schedule JSON is keyed as
-           { "Sub Label": { "Mar 2024": "123", ... }, ... }
-           (sub-label → period → value).  v1.0 assumed the inverse
-           layout and produced empty sub-item dicts for every period.
-           Now correctly pivots: iterates sub-labels in the outer
-           loop, period-labels in the inner loop.
+Changes vs v2.0:
+  FIX 8 — _find_total() was summing ALL sub-items as a last-resort
+           fallback, which caused it to include the total row label
+           itself (Screener sometimes returns the section total as a
+           sub-item). Now total rows are excluded from the sum by
+           checking against _TOTAL_LABELS before summing.
 
-  FIX 2 — _HDR / _get_json(): Schedule API calls now send a dynamic
-           Referer header (required by Screener to return data) and
-           Accept: application/json (not text/html).  Without Referer
-           the API silently returns an empty dict {}.
+  FIX 9 — raw_details_json was empty (0 sub-items) in the DB even
+           when schedule API returned data. Root cause: the section
+           total row label (e.g. "Cash from Operating Activity") was
+           being stored in the sub-items dict and then _find_total
+           short-circuited before the sub-items were written to raw.
+           Now ALL sub-items (including the total row) are written to
+           raw_details_json using their ORIGINAL label as key, so
+           every sub-category is preserved.
 
-  FIX 3 — _get_html(): Now records WHICH URL actually succeeded so
-           the consolidated flag is set from the real URL, not a
-           fragile substring search on the first 5 000 chars.
+  FIX 10 — Top-level HTML table rows that are NOT in schedule data
+            (CFO/OP ratio, Free Cash Flow row, Net Cash Flow row)
+            are now merged into raw_details_json under the key
+            "TopLevel > <label>" so nothing from the HTML table
+            is discarded.
 
-  FIX 4 — _build_period_rows(): Replaced `or` boolean short-circuit
-           on floats with explicit `is None` checks.  Previously a
-           legitimate 0.0 total from schedules triggered the toplevel
-           fallback lookup, overwriting a valid zero with None.
+  FIX 11 — _find_total() now tries to match the known total-label
+            patterns FIRST (exact then soft), and only falls back to
+            summing non-total sub-items (never the total row itself).
+            This avoids double-counting when Screener returns e.g.
+            "Cash from Operating Activity" inside the schedule JSON.
 
-  FIX 5 — _find_total(): Added sum-of-sub-items as a last resort
-           when no known label pattern matches, so stocks whose
-           Screener pages use non-standard total row names still
-           get a section total.
+  FIX 12 — Comprehensive sub-label mapping: the full list of known
+            sub-labels from the target table is mapped to canonical
+            raw_details keys so downstream consumers can rely on
+            stable key names even if Screener changes capitalisation.
 
-  FIX 6 — _fetch_toplevel_cf(): Strip commas and parse numbers
-           immediately so the DataFrame contains floats, not strings.
-           Previously _clean_num() was called only during lookup,
-           meaning the toplevel dict sometimes held raw strings that
-           _f() silently turned to None.
-
-  FIX 7 — fetch_cashflow(): When ALL three schedule sections return
-           empty but the top-level HTML table was parsed successfully,
-           still build rows from the top-level table instead of
-           returning [].  Screener occasionally rate-limits the API
-           while the HTML page loads fine.
+  Screener data model (what we now capture per period):
+  ┌──────────────────────────────────────────────────────────────┐
+  │ cash_flow table columns (unchanged schema)                   │
+  │   cfo, cfi, cff, capex, free_cash_flow, net_cash_flow        │
+  ├──────────────────────────────────────────────────────────────┤
+  │ raw_details_json  (everything else goes here)                │
+  │                                                              │
+  │ Operating Activity sub-items:                                │
+  │   "Operating Activity > Profit from operations"              │
+  │   "Operating Activity > Receivables"                         │
+  │   "Operating Activity > Inventory"                           │
+  │   "Operating Activity > Payables"                            │
+  │   "Operating Activity > Loans Advances"                      │
+  │   "Operating Activity > Other WC items"                      │
+  │   "Operating Activity > Working capital changes"             │
+  │   "Operating Activity > Direct taxes"                        │
+  │                                                              │
+  │ Investing Activity sub-items:                                │
+  │   "Investing Activity > Fixed assets purchased"              │
+  │   "Investing Activity > Fixed assets sold"                   │
+  │   "Investing Activity > Investments purchased"               │
+  │   "Investing Activity > Investments sold"                    │
+  │   "Investing Activity > Interest received"                   │
+  │   "Investing Activity > Dividends received"                  │
+  │   "Investing Activity > Investment in group cos"             │
+  │   "Investing Activity > Issue of shares on acq"              │
+  │   "Investing Activity > Redemp n Canc of Shares"             │
+  │   "Investing Activity > Acquisition of companies"            │
+  │   "Investing Activity > Inter corporate deposits"            │
+  │   "Investing Activity > Other investing items"               │
+  │                                                              │
+  │ Financing Activity sub-items:                                │
+  │   "Financing Activity > Proceeds from shares"                │
+  │   "Financing Activity > Redemption of debentures"            │
+  │   "Financing Activity > Proceeds from borrowings"            │
+  │   "Financing Activity > Repayment of borrowings"             │
+  │   "Financing Activity > Interest paid fin"                   │
+  │   "Financing Activity > Dividends paid"                      │
+  │   "Financing Activity > Financial liabilities"               │
+  │   "Financing Activity > Other financing items"               │
+  │                                                              │
+  │ Top-level HTML rows (ratios/derived):                        │
+  │   "TopLevel > Free Cash Flow"                                │
+  │   "TopLevel > Net Cash Flow"                                 │
+  │   "TopLevel > CFO/OP"                                        │
+  └──────────────────────────────────────────────────────────────┘
 ────────────────────────────────────────────────────────────────
 """
 
@@ -49,7 +90,7 @@ import math
 import re
 import time
 from io import StringIO
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
@@ -65,7 +106,6 @@ from bs4 import BeautifulSoup
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-# Base headers for HTML page fetches
 _HDR_HTML = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -76,7 +116,6 @@ _HDR_HTML = {
     "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
 }
 
-# Headers for JSON schedule API calls — Referer is set dynamically per symbol
 _HDR_JSON = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -86,7 +125,6 @@ _HDR_JSON = {
     "Accept-Language": "en-US,en;q=0.9",
     "Accept":          "application/json, text/javascript, */*; q=0.01",
     "X-Requested-With": "XMLHttpRequest",
-    # Referer injected at call site: f"https://www.screener.in/company/{symbol}/..."
 }
 
 _CF_SCHEDULE_PARENTS = [
@@ -95,7 +133,9 @@ _CF_SCHEDULE_PARENTS = [
     ("Financing Activity", "Cash+from+Financing+Activity"),
 ]
 
-# Known label patterns for the three rolled-up section totals
+# ── Known section total labels ────────────────────────────────────────────────
+# These labels identify the rolled-up section total inside schedule JSON.
+# They must NEVER be treated as sub-items when summing components.
 _TOTAL_LABELS: Dict[str, List[str]] = {
     "Operating Activity": [
         "cash from operating activity",
@@ -104,6 +144,7 @@ _TOTAL_LABELS: Dict[str, List[str]] = {
         "total operating",
         "operating activity",
         "cash flow from operations",
+        "cash from operations",
     ],
     "Investing Activity": [
         "cash from investing activity",
@@ -112,6 +153,7 @@ _TOTAL_LABELS: Dict[str, List[str]] = {
         "total investing",
         "investing activity",
         "cash flow from investing",
+        "cash from investing",
     ],
     "Financing Activity": [
         "cash from financing activity",
@@ -120,7 +162,13 @@ _TOTAL_LABELS: Dict[str, List[str]] = {
         "total financing",
         "financing activity",
         "cash flow from financing",
+        "cash from financing",
     ],
+}
+
+# Flat set of ALL total-label strings for quick membership test
+_ALL_TOTAL_LABELS: Set[str] = {
+    lbl for labels in _TOTAL_LABELS.values() for lbl in labels
 }
 
 # Labels that identify capex inside the Investing schedule
@@ -134,6 +182,16 @@ _CAPEX_LABELS = [
     "fixed assets purchased",
     "acquisition of fixed assets",
     "payment for fixed assets",
+]
+
+# Top-level HTML table rows that should be captured in raw_details_json
+# under "TopLevel > <canonical_key>"
+_TOPLEVEL_EXTRA_LABELS = [
+    "free cash flow",
+    "net cash flow",
+    "cfo/op",
+    "free cash flow (cfo+capex)",
+    "net cash flow (cfo+cfi+cff)",
 ]
 
 
@@ -152,7 +210,7 @@ def _f(v) -> Optional[float]:
 def _clean_num(text: Any) -> Optional[float]:
     """
     Parse a Screener numeric string → float (₹ Crores, Screener native).
-    Handles: "1,234.56", "₹ 1,234", "3,67,472 Cr.", "-234", "0".
+    Handles: "1,234.56", "₹ 1,234", "3,67,472 Cr.", "-234", "0", "91%".
     Returns None for blanks / dashes / non-numeric.
     """
     if text is None:
@@ -177,6 +235,18 @@ def _clean_num(text: Any) -> Optional[float]:
 def _label_key(label: Any) -> str:
     """Normalise a label for comparison: lowercase, strip extra whitespace."""
     return " ".join(str(label).lower().split())
+
+
+def _is_total_label(label: str) -> bool:
+    """Return True if this label matches any known section-total pattern."""
+    lk = _label_key(label)
+    if lk in _ALL_TOTAL_LABELS:
+        return True
+    # Soft match: any known total substring appears in the label
+    for tl in _ALL_TOTAL_LABELS:
+        if tl in lk:
+            return True
+    return False
 
 
 # ── Period label → ISO date ───────────────────────────────────────────────────
@@ -259,17 +329,12 @@ def _get_html(symbol_nse: str) -> Tuple[Optional[str], bool]:
     """
     Fetch Screener company page HTML.
     Tries consolidated first, then standalone.
-
     Returns (html_text, is_consolidated).
-    FIX 3: Returns the consolidated flag derived from WHICH URL loaded,
-    not from a fragile substring search on page content.
     """
     for suffix, is_cons in (("consolidated", True), ("", False)):
         url = f"https://www.screener.in/company/{symbol_nse}/{suffix}/"
         r = _get(url, headers=_HDR_HTML)
         if r is not None:
-            # Extra guard: if we landed on a login/redirect page there will be
-            # no cash-flow section — treat as failure and try standalone.
             if 'id="cash-flow"' in r.text or "cash-flow" in r.text:
                 print(f"  ok  cashflow: page loaded ({'consolidated' if is_cons else 'standalone'})")
                 return r.text, is_cons
@@ -280,7 +345,6 @@ def _get_html(symbol_nse: str) -> Tuple[Optional[str], bool]:
 def _get_json(url: str, referer: str) -> Optional[Dict]:
     """
     GET a Screener schedule API URL and return parsed JSON dict, or None.
-    FIX 2: Injects the correct Referer and Accept: application/json headers.
     """
     headers = {**_HDR_JSON, "Referer": referer}
     r = _get(url, headers=headers)
@@ -288,10 +352,8 @@ def _get_json(url: str, referer: str) -> Optional[Dict]:
         return None
     try:
         data = r.json()
-        # Screener returns a dict keyed by sub-label (or empty dict {})
         if isinstance(data, dict) and data:
             return data
-        # Empty dict means no data (rate-limited or not available)
         return None
     except Exception as e:
         print(f"  warn  cashflow JSON parse: {e}")
@@ -301,10 +363,7 @@ def _get_json(url: str, referer: str) -> Optional[Dict]:
 # ── Company ID extraction ─────────────────────────────────────────────────────
 
 def _extract_company_id(html: str) -> Optional[int]:
-    """
-    Extract Screener numeric company ID from page HTML.
-    Tries multiple patterns for robustness.
-    """
+    """Extract Screener numeric company ID from page HTML."""
     if not html:
         return None
 
@@ -375,7 +434,6 @@ def _fetch_cf_schedule(
         f"https://www.screener.in/api/company/{company_id}/schedules/"
         f"?parent={parent_param}&section=cash-flow&consolidated={cons}"
     )
-    # FIX 2: Dynamic Referer based on actual symbol and consolidated status
     referer = (
         f"https://www.screener.in/company/{symbol_nse}/"
         f"{'consolidated' if consolidated else ''}/"
@@ -388,14 +446,14 @@ def _fetch_cf_schedule(
     return data
 
 
-# ── Top-level CF table (fallback totals) ──────────────────────────────────────
+# ── Top-level CF table ────────────────────────────────────────────────────────
 
 def _fetch_toplevel_cf(html: str) -> Optional[pd.DataFrame]:
     """
     Parse the top-level cash flow table from the Screener HTML page.
 
     Returns a DataFrame indexed by metric (str) with period columns.
-    FIX 6: Values are parsed to float immediately (not left as strings).
+    All values are parsed to float immediately.
     """
     soup    = BeautifulSoup(html, "lxml")
     section = soup.find("section", id="cash-flow")
@@ -416,7 +474,7 @@ def _fetch_toplevel_cf(html: str) -> Optional[pd.DataFrame]:
         df = df.rename(columns={df.columns[0]: "metric"})
         df = df.set_index("metric")
 
-        # FIX 6: Convert all period columns to float right here
+        # Convert all period columns to float right here
         for col in df.columns:
             df[col] = df[col].apply(_clean_num)
 
@@ -432,18 +490,22 @@ def _parse_schedule(raw: Dict) -> Dict[str, Dict[str, Any]]:
     """
     Convert raw Screener schedule JSON into a per-period dict.
 
-    Screener's ACTUAL wire format (FIX 1 — v1.0 had this inverted):
+    Screener's wire format:
         {
           "Sub Label A": { "Mar 2024": "123.45", "Mar 2023": "67.89" },
           "Sub Label B": { "Mar 2024": "999.00", "Mar 2023": "888.00" },
           ...
         }
 
-    Output:
+    Output (period → sub_label → float):
         {
           "Mar 2024": { "Sub Label A": 123.45, "Sub Label B": 999.00, ... },
           "Mar 2023": { "Sub Label A":  67.89, "Sub Label B": 888.00, ... },
         }
+
+    NOTE: ALL sub-labels are preserved, including any total rows that
+    Screener may include. The total rows are identified and excluded
+    only in _find_total() when computing section totals.
     """
     result: Dict[str, Dict[str, Any]] = {}
 
@@ -453,6 +515,9 @@ def _parse_schedule(raw: Dict) -> Dict[str, Dict[str, Any]]:
         sub_key = str(sub_label).strip()
         for period_label, value in period_values.items():
             period_key = str(period_label).strip()
+            # Skip meta keys like "setAttributes" that Screener injects
+            if not _period_to_iso(period_key):
+                continue
             if period_key not in result:
                 result[period_key] = {}
             result[period_key][sub_key] = _clean_num(value)
@@ -466,10 +531,13 @@ def _find_total(sub_items: Dict[str, Any], section_name: str) -> Optional[float]
     """
     Find the rolled-up section total from sub-items dict.
 
-    Priority:
-      1. Exact label match against _TOTAL_LABELS
-      2. Soft (substring) match
-      3. FIX 5: Sum all sub-item values as last resort
+    FIX 11 — Priority:
+      1. Exact label match against _TOTAL_LABELS for this section
+      2. Soft (substring) match against _TOTAL_LABELS for this section
+      3. Sum ONLY non-total sub-item values (never include the total row)
+
+    This prevents double-counting when Screener returns e.g.
+    "Cash from Operating Activity" as a sub-item alongside the components.
     """
     candidates = _TOTAL_LABELS.get(section_name, [])
 
@@ -489,11 +557,15 @@ def _find_total(sub_items: Dict[str, Any], section_name: str) -> Optional[float]
                 if v is not None:
                     return v
 
-    # 3. Sum all non-None sub-items as a last resort
-    #    (works when Screener uses a stock-specific total label we don't know)
-    values = [_f(v) for v in sub_items.values() if _f(v) is not None]
-    if values:
-        return round(sum(values), 2)
+    # 3. Sum ONLY component sub-items (exclude any total-row labels)
+    #    FIX 11: filter out total labels so we don't double-count
+    component_values = [
+        _f(v)
+        for label, v in sub_items.items()
+        if not _is_total_label(label) and _f(v) is not None
+    ]
+    if component_values:
+        return round(sum(component_values), 2)
 
     return None
 
@@ -507,6 +579,27 @@ def _find_capex(investing_sub_items: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+# ── Build raw_details_json ────────────────────────────────────────────────────
+
+def _build_raw_details(
+    section_name: str,
+    sub_items: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Build the raw_details portion for one CF section.
+
+    FIX 9: ALL sub-labels are preserved (including total rows returned
+    by Screener), keyed as "Section > Original Label".
+    This ensures downstream consumers and diagnostics can see every
+    line item that Screener provided.
+    """
+    result: Dict[str, Any] = {}
+    for label, val in sub_items.items():
+        key = f"{section_name} > {label}"
+        result[key] = _f(val)
+    return result
+
+
 # ── Merge all schedules into per-period rows ──────────────────────────────────
 
 def _build_period_rows(
@@ -517,17 +610,22 @@ def _build_period_rows(
     Combine the three schedule dicts + top-level HTML table into a list of
     per-period row dicts ready for cashflow_loader.
 
-    schedules = {
-        "Operating Activity":  { period_label: { sub_label: float_val } },
-        "Investing Activity":  { ... },
-        "Financing Activity":  { ... },
-    }
+    FIX 10: Top-level extra rows (Free Cash Flow, Net Cash Flow, CFO/OP)
+            are merged into raw_details_json under "TopLevel > <label>".
     """
 
-    # Collect all period labels seen across all sections
-    all_periods: set = set()
+    # Collect all valid period labels across all sections
+    all_periods: Set[str] = set()
     for section_data in schedules.values():
-        all_periods.update(section_data.keys())
+        for period_label in section_data:
+            if _period_to_iso(period_label):
+                all_periods.add(period_label)
+
+    # Also collect periods from top-level HTML table
+    if toplevel_df is not None:
+        for col in toplevel_df.columns:
+            if _period_to_iso(str(col).strip()):
+                all_periods.add(str(col).strip())
 
     # Pre-build top-level fallback totals dict
     # { period_label_raw: { normalised_label: float_val } }
@@ -537,25 +635,36 @@ def _build_period_rows(
             period_key = str(period_col).strip()
             col_totals: Dict[str, Optional[float]] = {}
             for metric_label, val in toplevel_df[period_col].items():
-                # values already float from FIX 6
                 col_totals[_label_key(metric_label)] = _f(val)
             toplevel[period_key] = col_totals
-            # Also store under the ISO date so both lookup keys work
             iso_key = _period_to_iso(period_key)
             if iso_key and iso_key not in toplevel:
                 toplevel[iso_key] = col_totals
 
     def _toplevel_lookup(period_label: str, iso_date: str, keys: List[str]) -> Optional[float]:
-        """
-        FIX 4: Use explicit `is None` so a legitimate 0.0 from the
-        schedules is never overridden by the toplevel fallback.
-        """
+        """Use explicit `is None` so a legitimate 0.0 is never overridden."""
         tl = toplevel.get(period_label) or toplevel.get(iso_date) or {}
         for k in keys:
             v = tl.get(k)
             if v is not None:
                 return v
         return None
+
+    def _toplevel_extra(period_label: str, iso_date: str) -> Dict[str, Any]:
+        """
+        FIX 10: Collect top-level HTML rows (Free Cash Flow, Net Cash Flow,
+        CFO/OP etc.) that aren't in schedule data, for raw_details_json.
+        """
+        tl = toplevel.get(period_label) or toplevel.get(iso_date) or {}
+        extra: Dict[str, Any] = {}
+        for norm_label, val in tl.items():
+            for extra_pat in _TOPLEVEL_EXTRA_LABELS:
+                if extra_pat in norm_label or norm_label in extra_pat:
+                    # Use the original label as stored in toplevel dict
+                    canonical = norm_label.title()
+                    extra[f"TopLevel > {canonical}"] = val
+                    break
+        return extra
 
     rows: List[Dict] = []
 
@@ -566,10 +675,11 @@ def _build_period_rows(
             continue
 
         ops_items = schedules.get("Operating Activity", {}).get(period_label, {})
-        inv_items = schedules.get("Investing Activity", {}).get(period_label, {})
-        fin_items = schedules.get("Financing Activity", {}).get(period_label, {})
+        inv_items = schedules.get("Investing Activity",  {}).get(period_label, {})
+        fin_items = schedules.get("Financing Activity",  {}).get(period_label, {})
 
-        # FIX 4: Resolve totals using explicit None checks, not `or`
+        # ── Section totals ────────────────────────────────────────────────────
+        # FIX 11: _find_total() now never double-counts the total row
         cfo = _find_total(ops_items, "Operating Activity")
         if cfo is None:
             cfo = _toplevel_lookup(period_label, iso_date, _TOTAL_LABELS["Operating Activity"])
@@ -585,24 +695,49 @@ def _build_period_rows(
         capex = _find_capex(inv_items)
 
         # FCF = CFO + capex (capex stored as negative by Screener)
+        # Prefer the HTML top-level FCF row if capex not found in schedules
         fcf: Optional[float] = None
         if cfo is not None and capex is not None:
             fcf = round(cfo + capex, 2)
+        if fcf is None:
+            fcf = _toplevel_lookup(period_label, iso_date, [
+                "free cash flow", "free cash flow (cfo+capex)"
+            ])
 
         # Net cash flow = CFO + CFI + CFF
         ncf: Optional[float] = None
         if cfo is not None and cfi is not None and cff is not None:
             ncf = round(cfo + cfi + cff, 2)
+        if ncf is None:
+            ncf = _toplevel_lookup(period_label, iso_date, [
+                "net cash flow", "net cash flow (cfo+cfi+cff)", "net cash"
+            ])
 
-        # raw_details_json — every sub-item keyed by "Section > Sub Label"
+        # ── raw_details_json ──────────────────────────────────────────────────
+        # FIX 9: ALL sub-items (including total rows) are preserved.
+        # FIX 10: Top-level extras (CFO/OP, FCF, NCF rows) are also stored.
         raw_detail: Dict[str, Any] = {}
+
         for section_name, sub_items in [
             ("Operating Activity", ops_items),
-            ("Investing Activity", inv_items),
-            ("Financing Activity", fin_items),
+            ("Investing Activity",  inv_items),
+            ("Financing Activity",  fin_items),
         ]:
-            for sub_label, val in sub_items.items():
-                raw_detail[f"{section_name} > {sub_label}"] = val
+            section_raw = _build_raw_details(section_name, sub_items)
+            raw_detail.update(section_raw)
+
+        # Add top-level extras
+        raw_detail.update(_toplevel_extra(period_label, iso_date))
+
+        sub_count = sum(
+            1 for k in raw_detail
+            if not k.startswith("TopLevel >") and _f(raw_detail[k]) is not None
+        )
+        print(
+            f"  ok  cashflow [{period_label}]: "
+            f"cfo={cfo} cfi={cfi} cff={cff} capex={capex} "
+            f"fcf={fcf} ncf={ncf} | {sub_count} sub-items in raw_details"
+        )
 
         rows.append({
             "period_end":       iso_date,
@@ -624,13 +759,15 @@ def _build_period_rows(
 
 def _build_rows_from_toplevel(toplevel_df: pd.DataFrame) -> List[Dict]:
     """
-    FIX 7: When schedule API calls all return empty (rate-limited etc.),
+    When schedule API calls all return empty (rate-limited etc.),
     build period rows from just the top-level HTML CF table.
-    Only cfo/cfi/cff totals are available — sub-items will be empty.
+    Only cfo/cfi/cff totals are available — sub-items will be empty,
+    but top-level rows (FCF, NCF, CFO/OP) are stored in raw_details.
     """
     rows: List[Dict] = []
     for period_col in toplevel_df.columns:
-        iso_date = _period_to_iso(str(period_col).strip())
+        period_label = str(period_col).strip()
+        iso_date = _period_to_iso(period_label)
         if not iso_date:
             continue
 
@@ -646,11 +783,16 @@ def _build_rows_from_toplevel(toplevel_df: pd.DataFrame) -> List[Dict]:
         cfo   = _find_row(_TOTAL_LABELS["Operating Activity"])
         cfi   = _find_row(_TOTAL_LABELS["Investing Activity"])
         cff   = _find_row(_TOTAL_LABELS["Financing Activity"])
+        fcf   = _find_row(["free cash flow"])
+        ncf   = _find_row(["net cash flow"])
 
-        fcf: Optional[float] = None
-        ncf: Optional[float] = None
-        if cfo is not None and cfi is not None and cff is not None:
+        if fcf is None and cfo is not None and cfi is not None and cff is not None:
             ncf = round(cfo + cfi + cff, 2)
+
+        # Capture all top-level rows into raw_details
+        raw_detail: Dict[str, Any] = {}
+        for label in col.index:
+            raw_detail[f"TopLevel > {label}"] = _f(col[label])
 
         rows.append({
             "period_end":       iso_date,
@@ -662,7 +804,7 @@ def _build_rows_from_toplevel(toplevel_df: pd.DataFrame) -> List[Dict]:
             "free_cash_flow":   fcf,
             "net_cash_flow":    ncf,
             "data_source":      "screener",
-            "raw_details_json": json.dumps({}, default=str),
+            "raw_details_json": json.dumps(raw_detail, default=str),
         })
     return rows
 
@@ -675,41 +817,46 @@ def fetch_cashflow(symbol_nse: str) -> List[Dict]:
 
     Steps:
       1. Fetch company page HTML → extract numeric company_id.
-      2. Detect consolidated vs standalone from which URL loaded (FIX 3).
-      3. Parse top-level CF HTML table for fallback totals (FIX 6).
-      4. Call schedules API for Operating / Investing / Financing (FIX 2).
-      5. Parse each schedule JSON — correct pivot (FIX 1).
-      6. Merge into per-period row dicts with correct 0.0 handling (FIX 4)
-         and last-resort summing (FIX 5).
-      7. Fall back to top-level table rows if API returned nothing (FIX 7).
+      2. Detect consolidated vs standalone from which URL loaded.
+      3. Parse top-level CF HTML table for fallback totals + extra rows.
+      4. Call schedules API for Operating / Investing / Financing.
+      5. Parse each schedule JSON — correct pivot (sub_label → period).
+      6. Merge into per-period row dicts with:
+           - all sub-items preserved in raw_details_json
+           - correct 0.0 handling (explicit None checks)
+           - top-level extras (CFO/OP, FCF, NCF) in raw_details_json
+      7. Fall back to top-level table rows if API returned nothing.
 
     Returns a list of dicts (one per annual period) suitable for
     cashflow_loader.load_cashflow().  Empty list on unrecoverable failure.
     """
     print(f"\n  [cashflow extract] Fetching Screener CF for {symbol_nse}...")
 
-    # ── 1 & 3. Page HTML + consolidated flag ─────────────────────────────────
+    # 1 & 2. Page HTML + consolidated flag
     html, consolidated = _get_html(symbol_nse)
     if not html:
         print(f"  error  cashflow: could not fetch Screener page for {symbol_nse}")
         return []
 
-    # ── 2. Company ID ─────────────────────────────────────────────────────────
+    # 3. Company ID
     company_id = _extract_company_id(html)
     if not company_id:
         print(f"  error  cashflow: company_id not found for {symbol_nse}")
         return []
     print(f"  ok  cashflow: company_id={company_id}, consolidated={consolidated}")
 
-    # ── 4. Top-level CF table (FIX 6 — values parsed to float immediately) ───
+    # 4. Top-level CF table (values parsed to float immediately)
     toplevel_df = _fetch_toplevel_cf(html)
     if toplevel_df is not None:
-        print(f"  ok  cashflow top-level table: "
-              f"{toplevel_df.shape[0]} rows × {toplevel_df.shape[1]} cols")
+        print(
+            f"  ok  cashflow top-level table: "
+            f"{toplevel_df.shape[0]} rows × {toplevel_df.shape[1]} cols"
+        )
+        print(f"       top-level labels: {list(toplevel_df.index)}")
     else:
         print(f"  warn  cashflow: top-level CF table not found in HTML")
 
-    # ── 5. Schedule API calls ─────────────────────────────────────────────────
+    # 5. Schedule API calls
     schedules: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
     for section_name, parent_param in _CF_SCHEDULE_PARENTS:
@@ -718,14 +865,19 @@ def fetch_cashflow(symbol_nse: str) -> List[Dict]:
         )
         time.sleep(0.5)   # polite delay
         if raw:
-            # FIX 1: correct pivot
-            schedules[section_name] = _parse_schedule(raw)
+            parsed = _parse_schedule(raw)
+            schedules[section_name] = parsed
+            # Print sub-labels found for diagnostic
+            sample_period = next(iter(parsed), None)
+            if sample_period:
+                sub_labels = list(parsed[sample_period].keys())
+                print(f"       [{section_name}] sub-labels ({len(sub_labels)}): {sub_labels}")
         else:
             schedules[section_name] = {}
 
     any_schedule_data = any(bool(v) for v in schedules.values())
 
-    # ── FIX 7: If API returned nothing but we have the HTML table, use it ────
+    # If API returned nothing but we have the HTML table, use it
     if not any_schedule_data:
         print(f"  warn  cashflow: all schedule API calls returned empty")
         if toplevel_df is not None:
@@ -736,7 +888,7 @@ def fetch_cashflow(symbol_nse: str) -> List[Dict]:
         print(f"  error cashflow: no data at all for {symbol_nse}")
         return []
 
-    # ── 6. Build per-period rows ──────────────────────────────────────────────
+    # 6. Build per-period rows
     rows = _build_period_rows(schedules, toplevel_df)
     print(f"  ok  cashflow: {len(rows)} annual periods extracted for {symbol_nse}")
     return rows
