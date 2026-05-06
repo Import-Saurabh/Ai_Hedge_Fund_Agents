@@ -1,1 +1,6 @@
+pandas
+yfinance
+requests
+httpx
+beautifulsoup4
 graphifyy
