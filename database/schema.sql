@@ -2,7 +2,7 @@
 -- Generated from SQLite .schema output
 
 -- Core stocks table
-CREATE TABLE stocks (
+CREATE TABLE IF NOT EXISTS stocks (
     symbol          TEXT PRIMARY KEY,
     name            TEXT,
     exchange        TEXT DEFAULT 'NSE',
@@ -14,7 +14,7 @@ CREATE TABLE stocks (
 );
 
 -- Daily price data
-CREATE TABLE price_daily (
+CREATE TABLE IF NOT EXISTS price_daily (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol          TEXT NOT NULL REFERENCES stocks(symbol),
     date            DATE NOT NULL,
@@ -28,7 +28,7 @@ CREATE TABLE price_daily (
 );
 
 -- Intraday price data
-CREATE TABLE price_intraday (
+CREATE TABLE IF NOT EXISTS price_intraday (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol          TEXT NOT NULL REFERENCES stocks(symbol),
     ts              TIMESTAMP NOT NULL,
@@ -38,7 +38,7 @@ CREATE TABLE price_intraday (
 );
 
 -- Fundamentals data
-CREATE TABLE fundamentals (
+CREATE TABLE IF NOT EXISTS fundamentals (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol                  TEXT NOT NULL REFERENCES stocks(symbol),
     as_of_date              DATE NOT NULL,
@@ -106,7 +106,7 @@ CREATE TABLE fundamentals (
 );
 
 -- Quarterly results
-CREATE TABLE quarterly_results (
+CREATE TABLE IF NOT EXISTS quarterly_results (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol              TEXT NOT NULL REFERENCES stocks(symbol),
     period_end          DATE NOT NULL,
@@ -133,7 +133,7 @@ CREATE TABLE quarterly_results (
 );
 
 -- Annual results
-CREATE TABLE annual_results (
+CREATE TABLE IF NOT EXISTS annual_results (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol                  TEXT NOT NULL REFERENCES stocks(symbol),
     period_end              DATE NOT NULL,
@@ -162,7 +162,7 @@ CREATE TABLE annual_results (
 );
 
 -- Annual cashflow derived
-CREATE TABLE "annual_cashflow_derived" (
+CREATE TABLE IF NOT EXISTS "annual_cashflow_derived" (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol              TEXT NOT NULL REFERENCES stocks(symbol),
     annual_end         DATE NOT NULL,
@@ -186,7 +186,7 @@ CREATE TABLE "annual_cashflow_derived" (
 );
 
 -- Corporate actions
-CREATE TABLE corporate_actions (
+CREATE TABLE IF NOT EXISTS corporate_actions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol          TEXT NOT NULL REFERENCES stocks(symbol),
     action_date     DATE NOT NULL,
@@ -197,7 +197,7 @@ CREATE TABLE corporate_actions (
 );
 
 -- Technical indicators
-CREATE TABLE technical_indicators (
+CREATE TABLE IF NOT EXISTS technical_indicators (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol          TEXT NOT NULL REFERENCES stocks(symbol),
     date            DATE NOT NULL,
@@ -222,7 +222,7 @@ CREATE TABLE technical_indicators (
 );
 
 -- Market indices
-CREATE TABLE market_indices (
+CREATE TABLE IF NOT EXISTS market_indices (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     snapshot_date   DATE NOT NULL,
     index_name      TEXT NOT NULL,
@@ -231,7 +231,7 @@ CREATE TABLE market_indices (
 );
 
 -- Forex & commodities
-CREATE TABLE forex_commodities (
+CREATE TABLE IF NOT EXISTS forex_commodities (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     snapshot_date   DATE NOT NULL,
     instrument      TEXT NOT NULL,
@@ -240,7 +240,7 @@ CREATE TABLE forex_commodities (
 );
 
 -- RBI rates
-CREATE TABLE rbi_rates (
+CREATE TABLE IF NOT EXISTS rbi_rates (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     effective_date  DATE NOT NULL,
     repo_rate       REAL, reverse_repo REAL, sdf_rate REAL,
@@ -250,7 +250,7 @@ CREATE TABLE rbi_rates (
 );
 
 -- Macro indicators
-CREATE TABLE macro_indicators (
+CREATE TABLE IF NOT EXISTS macro_indicators (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     snapshot_date   DATE NOT NULL,
     indicator_name  TEXT NOT NULL,
@@ -259,7 +259,7 @@ CREATE TABLE macro_indicators (
 );
 
 -- Ownership
-CREATE TABLE ownership (
+CREATE TABLE IF NOT EXISTS ownership (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol                  TEXT NOT NULL REFERENCES stocks(symbol),
     snapshot_date           DATE NOT NULL,
@@ -281,7 +281,7 @@ CREATE TABLE ownership (
 );
 
 -- Ownership history
-CREATE TABLE ownership_history (
+CREATE TABLE IF NOT EXISTS ownership_history (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol                  TEXT NOT NULL REFERENCES stocks(symbol),
     period_end              DATE NOT NULL,
@@ -296,7 +296,7 @@ CREATE TABLE ownership_history (
 );
 
 -- Earnings history
-CREATE TABLE earnings_history (
+CREATE TABLE IF NOT EXISTS earnings_history (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol          TEXT NOT NULL REFERENCES stocks(symbol),
     quarter_end     DATE NOT NULL,
@@ -306,7 +306,7 @@ CREATE TABLE earnings_history (
 );
 
 -- Earnings estimates
-CREATE TABLE earnings_estimates (
+CREATE TABLE IF NOT EXISTS earnings_estimates (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol          TEXT NOT NULL REFERENCES stocks(symbol),
     snapshot_date   DATE NOT NULL,
@@ -317,7 +317,7 @@ CREATE TABLE earnings_estimates (
 );
 
 -- EPS trend
-CREATE TABLE eps_trend (
+CREATE TABLE IF NOT EXISTS eps_trend (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol          TEXT NOT NULL REFERENCES stocks(symbol),
     snapshot_date   DATE NOT NULL,
@@ -328,7 +328,7 @@ CREATE TABLE eps_trend (
 );
 
 -- EPS revisions
-CREATE TABLE eps_revisions (
+CREATE TABLE IF NOT EXISTS eps_revisions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol          TEXT NOT NULL REFERENCES stocks(symbol),
     snapshot_date   DATE NOT NULL,
@@ -339,7 +339,7 @@ CREATE TABLE eps_revisions (
 );
 
 -- Data quality log
-CREATE TABLE data_quality_log (
+CREATE TABLE IF NOT EXISTS data_quality_log (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     run_timestamp       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     symbol              TEXT NOT NULL,
@@ -353,7 +353,7 @@ CREATE TABLE data_quality_log (
 );
 
 -- Run log
-CREATE TABLE run_log (
+CREATE TABLE IF NOT EXISTS run_log (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol          TEXT NOT NULL,
     run_timestamp   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -364,7 +364,7 @@ CREATE TABLE run_log (
 );
 
 -- Growth metrics
-CREATE TABLE "growth_metrics"(
+CREATE TABLE IF NOT EXISTS "growth_metrics"(
     id INT,
     symbol TEXT,
     as_of_date NUM,
@@ -394,7 +394,7 @@ CREATE TABLE "growth_metrics"(
 );
 
 -- Balance sheet
-CREATE TABLE balance_sheet (
+CREATE TABLE IF NOT EXISTS balance_sheet (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol TEXT NOT NULL,
     period_end DATE NOT NULL,
@@ -432,7 +432,7 @@ CREATE TABLE balance_sheet (
 );
 
 -- Cash flow
-CREATE TABLE cash_flow (
+CREATE TABLE IF NOT EXISTS cash_flow (
     id                          INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol                      TEXT NOT NULL REFERENCES stocks(symbol),
     period_end                  DATE NOT NULL,
@@ -452,7 +452,7 @@ CREATE TABLE cash_flow (
 );
 
 -- Profit and loss (legacy/alternative table)
-CREATE TABLE profit_and_loss (
+CREATE TABLE IF NOT EXISTS profit_and_loss (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol TEXT NOT NULL,
     period_end DATE NOT NULL,
@@ -474,22 +474,26 @@ CREATE TABLE profit_and_loss (
     completeness_pct REAL,
     missing_fields_json TEXT
 );
+
 -- System table (optional, created automatically by SQLite)
-CREATE TABLE sqlite_sequence(name,seq);
 
 -- Indexes
-CREATE INDEX idx_price_sym_date ON price_daily(symbol, date DESC);
-CREATE INDEX idx_price_intra_sym ON price_intraday(symbol, ts DESC);
-CREATE INDEX idx_qr_sym ON quarterly_results(symbol, period_end DESC);
-CREATE INDEX idx_ar_sym ON annual_results(symbol, period_end DESC);
-CREATE INDEX idx_qcd_sym ON "annual_cashflow_derived"(symbol, annual_end DESC);
-CREATE INDEX idx_ca_sym ON corporate_actions(symbol, action_date DESC);
-CREATE INDEX idx_ti_sym ON technical_indicators(symbol, date DESC);
-CREATE INDEX idx_own_hist ON ownership_history(symbol, period_end DESC);
-CREATE INDEX idx_dql_sym ON data_quality_log(symbol, run_timestamp DESC);
-CREATE INDEX idx_bs_sym ON balance_sheet(symbol, period_type, period_end DESC);
-CREATE INDEX idx_cf_sym_date ON cash_flow(symbol, period_end DESC);
-CREATE INDEX idx_cf_sym ON cash_flow(symbol, period_type, period_end DESC);
+CREATE INDEX IF NOT EXISTS idx_price_sym_date ON price_daily(symbol, date DESC);
+CREATE INDEX IF NOT EXISTS idx_price_intra_sym ON price_intraday(symbol, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_qr_sym ON quarterly_results(symbol, period_end DESC);
+CREATE INDEX IF NOT EXISTS idx_ar_sym ON annual_results(symbol, period_end DESC);
+CREATE INDEX IF NOT EXISTS idx_qcd_sym ON "annual_cashflow_derived"(symbol, annual_end DESC);
+CREATE INDEX IF NOT EXISTS idx_ca_sym ON corporate_actions(symbol, action_date DESC);
+CREATE INDEX IF NOT EXISTS idx_ti_sym ON technical_indicators(symbol, date DESC);
+CREATE INDEX IF NOT EXISTS idx_own_hist ON ownership_history(symbol, period_end DESC);
+CREATE INDEX IF NOT EXISTS idx_dql_sym ON data_quality_log(symbol, run_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_bs_sym ON balance_sheet(symbol, period_type, period_end DESC);
+CREATE INDEX IF NOT EXISTS idx_cf_sym_date ON cash_flow(symbol, period_end DESC);
+CREATE INDEX IF NOT EXISTS idx_cf_sym ON cash_flow(symbol, period_type, period_end DESC);
+
 -- Unique indexes
-CREATE UNIQUE INDEX growth_metrics_symbol_date ON growth_metrics(symbol, as_of_date);
-CREATE UNIQUE INDEX idx_pnl_unique ON profit_and_loss(symbol, period_end, period_type);
+CREATE UNIQUE INDEX IF NOT EXISTS growth_metrics_symbol_date
+ON growth_metrics(symbol, as_of_date);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pnl_unique
+ON profit_and_loss(symbol, period_end, period_type);
