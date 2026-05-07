@@ -1,12 +1,15 @@
 """
-etl/extract/fundamentals.py  v4.0
+etl/extract/fundamentals.py  v5.0
 ────────────────────────────────────────────────────────────────
-Fixes vs v3:
+Changes vs v4:
+  • fundamentals_extract_patch.py REMOVED — all logic merged here
+  • Dropped: free_cash_flow, operating_cf, capex, net_income keys
+    (those live in cash_flow / income_statement tables)
   • EV / EV_EBITDA / EV_Revenue always computed when mc+debt+cash
-    are available — no longer NULL on first run
+    are available
   • forward_pe pulled from info["forwardPE"] with sanity check
   • earnings_growth_json always populated from annual income stmt
-  • All monetary values confirmed in Rs. Crores before return
+  • All monetary values in Rs. Crores
   • TTM figures use last 4 quarterly periods correctly
 ────────────────────────────────────────────────────────────────
 """
@@ -16,7 +19,6 @@ import json
 import yfinance as yf
 from typing import Optional, Dict, Any, Tuple
 import pandas as pd
-from etl.extract.fundamentals_extract_patch import _apply_all_patches
 
 _REVENUE_SUBROW_PATTERNS = [
     "excise", "adjustment", "net of", "restate", "proforma",
@@ -171,9 +173,12 @@ def _build_earnings_growth_json(inc: pd.DataFrame) -> Optional[str]:
 
 def fetch_fundamentals(symbol: str) -> Dict[str, Any]:
     """
-    Compute all fundamentals metrics.
+    Compute all fundamentals metrics from yfinance.
     MONETARY VALUES → Rs. Crores
     RATIOS / % / P-multiples → unchanged (unitless)
+
+    NOTE: free_cash_flow, operating_cf, capex, net_income are NOT
+    returned here — they live in cash_flow / income_statement tables.
     """
     t = yf.Ticker(symbol)
 
@@ -242,20 +247,12 @@ def fetch_fundamentals(symbol: str) -> Dict[str, Any]:
     if cash_raw is None:
         cash_raw = _safe_float(info.get("totalCash"))
 
-    # CF rows
-    op_cf_raw = _get_row(cf, "Operating Cash Flow",
-                         "Net Cash Provided By Operating Activities")
-    capex_raw = _get_row(cf, "Capital Expenditure",
-                         "Purchase Of Property Plant And Equipment",
-                         "Purchases Of Property Plant And Equipment")
-
     # ── Convert to Crores ─────────────────────────────────────
     revenue      = _cr(revenue_raw)
     net_inc      = _cr(net_inc_raw)
     ebitda       = _cr(ebitda_raw)
     ebit         = _cr(ebit_raw)
     int_exp      = _cr(int_exp_raw)
-    dep          = _cr(dep_raw)
     total_assets = _cr(total_assets_raw)
     curr_liab    = _cr(curr_liab_raw)
     curr_assets  = _cr(curr_assets_raw)
@@ -266,8 +263,6 @@ def fetch_fundamentals(symbol: str) -> Dict[str, Any]:
     cogs         = _cr(cogs_raw)
     inventory    = _cr(inventory_raw)
     cash         = _cr(cash_raw)
-    op_cf        = _cr(op_cf_raw)
-    capex_val    = _cr(capex_raw)
     mc_raw       = _safe_float(info.get("marketCap"))
     mc           = _cr(mc_raw)
 
@@ -290,15 +285,6 @@ def fetch_fundamentals(symbol: str) -> Dict[str, Any]:
 
     if _ebit and int_exp and int_exp != 0:
         out["Interest Coverage"] = round(abs(_ebit / int_exp), 2)
-
-    # ── FCF (Crores) ──────────────────────────────────────────
-    if op_cf is not None:
-        capex_abs = abs(capex_val) if capex_val else 0
-        out["Free Cash Flow"] = round(op_cf - capex_abs, 2)
-        out["Operating CF"]   = op_cf
-        out["CapEx"]          = capex_abs
-    elif info.get("freeCashflow"):
-        out["Free Cash Flow"] = _cr(info["freeCashflow"])
 
     # ── Margins ───────────────────────────────────────────────
     gm_pct, _, _ = _compute_gross_margin_safe(inc)
@@ -356,7 +342,6 @@ def fetch_fundamentals(symbol: str) -> Dict[str, Any]:
         out["Forward PE"] = round(fwd_pe, 2)
 
     # ── EV (Crores) ───────────────────────────────────────────
-    # Resolve total_debt and cash from info if BS gave nothing
     if total_debt is None:
         total_debt = _cr(info.get("totalDebt"))
     if cash is None:
@@ -373,18 +358,18 @@ def fetch_fundamentals(symbol: str) -> Dict[str, Any]:
     # ── Monetary scale outputs ────────────────────────────────
     out["Market Cap"]  = mc
     out["Revenue"]     = revenue
-    out["Net Income"]  = net_inc
     out["EBITDA"]      = ebitda
     out["Inventory"]   = inventory
     out["Total Debt"]  = total_debt
     out["Cash"]        = cash
+    # NOTE: Net Income intentionally excluded — lives in income_statement table
 
     # ── earnings_growth_json ──────────────────────────────────
     egj = _build_earnings_growth_json(inc)
     if egj:
         out["earnings_growth_json"] = egj
 
-    # ── TTM EPS (last 4 quarters) ─────────────────────────────
+    # ── TTM EPS / TTM P/E (last 4 quarters) ──────────────────
     try:
         q_inc = t.quarterly_income_stmt
         if q_inc is not None and not q_inc.empty:
@@ -402,5 +387,4 @@ def fetch_fundamentals(symbol: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    _apply_all_patches(out, bs, cf, inc, info)
     return out
