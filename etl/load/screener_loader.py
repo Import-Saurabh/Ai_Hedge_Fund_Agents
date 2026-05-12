@@ -657,7 +657,10 @@ def load_balance_from_screener(df: pd.DataFrame, symbol: str):
 
     eq_r      = _row(df, "Equity Capital")
     res_r     = _row(df, "Reserves")
-    bor_r     = _row(df, "Borrowings")
+    # Banks (e.g. HDFC Bank) show "Deposits" instead of "Borrowings" on Screener.
+    # No schedule breakdown exists for this row — it must be matched by label.
+    bor_r     = _row(df, "Borrowings", "Deposits", "Deposits & Borrowings",
+                         "Total Deposits", "Deposits and Borrowings")
     lt_bor_r  = _row(df, "Long term Borrowings")
     st_bor_r  = _row(df, "Short term Borrowings")
     lease_r   = _row(df, "Lease Liabilities")
@@ -676,7 +679,9 @@ def load_balance_from_screener(df: pd.DataFrame, symbol: str):
     otha_r    = _row(df, "Other Assets")
     invtry_r  = _row(df, "Inventories")
     trec_r    = _row(df, "Trade receivables", "Trade Receivables", "Debtors", "Sundry Debtors")
-    cash_r    = _row(df, "Cash Equivalents", "Cash & Equivalents", "Cash and Equivalents")
+    cash_r    = _row(df, "Cash Equivalents", "Cash & Equivalents", "Cash and Equivalents",
+                         "Cash and balances with RBI", "Cash & Bank Balances",
+                         "Cash and Bank Balances", "Cash & Balances with RBI")
     loans_r   = _row(df, "Loans n Advances", "Loans and Advances", "Loans & Advances")
     oasset_r  = _row(df, "Other asset items", "Other Asset Items")
     tota_r    = _row(df, "Total Assets")

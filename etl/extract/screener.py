@@ -490,7 +490,7 @@ def _merge_schedules_into_bs(bs_df: pd.DataFrame,
                 if col in df.columns:
                     # Only fill if cell is NaN / 0
                     existing = df.at[canonical, col]
-                    if pd.isna(existing) or existing == 0:
+                    if pd.isna(existing):
                         df.at[canonical, col] = val
         else:
             # Build a new row

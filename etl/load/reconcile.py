@@ -177,11 +177,11 @@ def reconcile_balance_sheet(symbol: str, conn):
 
         conn.execute("""
             UPDATE balance_sheet SET
-                net_debt            = COALESCE(net_debt, ?),
+                net_debt            = CASE WHEN ? IS NOT NULL THEN ? ELSE net_debt END,
                 completeness_pct    = ?,
                 missing_fields_json = ?
             WHERE rowid = ?
-        """, (net_d, comp, json.dumps(missing), rowid))
+        """, (net_d, net_d, comp, json.dumps(missing), rowid))
 
     conn.commit()
     print(f"  ✅ reconcile balance_sheet: {len(rows)} rows for {symbol}")
