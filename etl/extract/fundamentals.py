@@ -1,7 +1,14 @@
 """
-etl/extract/fundamentals.py  v5.1
+etl/extract/fundamentals.py  v5.2
 ────────────────────────────────────────────────────────────────
-Changes vs v5.0:
+Changes vs v5.1:
+  • BUG FIX — ev_ebitda was always NULL for tickers (e.g. TCS.NS)
+    where yfinance income_stmt has no explicit "EBITDA" row.
+    ebitda_raw is now derived as ebit_raw + dep_raw when the
+    direct lookup returns None, enabling ev_ebitda (and all
+    ebitda-dependent metrics) to populate correctly.
+────────────────────────────────────────────────────────────────
+Changes vs v5.0 (v5.1):
   • BUG FIX — EV calculation: total_debt=None (debt-free tickers like
     TCS) is now treated as 0 instead of blocking EV entirely.
     EV = market_cap + (total_debt or 0) - (cash or 0)
@@ -201,6 +208,11 @@ def fetch_fundamentals(symbol: str) -> Dict[str, Any]:
     dep_raw     = _get_row(inc, "Reconciled Depreciation",
                             "Depreciation And Amortization In Income Stat",
                             "Depreciation")
+
+    # BUG FIX: yfinance often omits an explicit "EBITDA" row for .NS tickers.
+    # Derive it as EBIT + Depreciation when the direct lookup returns None.
+    if ebitda_raw is None and ebit_raw is not None and dep_raw is not None:
+        ebitda_raw = ebit_raw + dep_raw
 
     # ── Raw BS rows ───────────────────────────────────────────
     total_assets_raw = _get_row(bs, "Total Assets")

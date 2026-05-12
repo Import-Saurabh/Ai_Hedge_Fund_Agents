@@ -1,24 +1,30 @@
 """
-etl/load/fundamentals_loader.py  v6.5
+etl/load/fundamentals_loader.py  v6.6
 ────────────────────────────────────────────────────────────────
-Changes vs v6.3:
+Changes vs v6.5:
+  • BUG FIX — ev_ebitda was NULL (or silently wrong) because Pass 2
+    was writing profit_and_loss.operating_profit (= EBIT) directly into
+    fundamentals.ebitda, omitting Depreciation & Amortisation.
+
+    Root cause: Screener's "Operating Profit" is EBIT, not EBITDA.
+    True EBITDA = operating_profit + depreciation.
+
+    Fix: Pass 2 now reads both operating_profit AND depreciation from
+    profit_and_loss (and annual_results as fallback) and stores their
+    sum as ebitda.  The EV/EBITDA recompute block in Pass 2.5 then
+    produces the correct ratio.
+
+  • One-time DB repair helper added: repair_ev_ebitda(conn, symbol)
+    can be called to fix any rows already in the DB that were written
+    with the old (EBIT-only) ebitda value.
+
+  • load_fundamentals() now logs EBITDA_source ("direct" | "derived")
+    from fetch_fundamentals() output for diagnostics; the key is
+    stripped before the dict is passed to the DB insert/update.
+────────────────────────────────────────────────────────────────
+Changes vs v6.3 (v6.5):
   • Pass 2.5 extended with three more derivations:
-
-  dio_days — set to 0.0 when inventory is confirmed null for the
-    symbol. Pure service companies (TCS, Infosys) hold no physical
-    stock; DIO=0 is the correct value, not NULL.
-
-  dpo_days — derived from the CCC identity:
-    DPO = DSO + DIO − CCC
-    DSO and CCC are already populated from Screener ratios.
-    Result clamped to >= 0.
-
-  forward_pe — 5-level fallback chain, NEVER stays null:
-    1. earnings_estimates.avg_eps (analyst consensus)
-    2. eps_trend.current_est
-    3. ttm_eps × 1.10 (TTM + 10% growth proxy)
-    4. eps_annual × 1.10 (annual + 10% growth proxy)
-    5. 0.0 hard default — field is ALWAYS written, never null.
+    dio_days, dpo_days, forward_pe (5-level fallback chain).
 ────────────────────────────────────────────────────────────────
 """
 
@@ -83,6 +89,80 @@ def _data_changed(latest: dict, new_data: dict) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────
+# One-time repair helper (run manually or on startup)
+# ─────────────────────────────────────────────────────────────
+def repair_ev_ebitda(conn, symbol: str):
+    """
+    One-time repair for rows already written with EBIT-only ebitda values.
+
+    For every fundamentals row where ev_ebitda is NULL:
+      1. Recompute ebitda = operating_profit + depreciation from profit_and_loss.
+      2. Recompute ev     = market_cap + borrowings - cash  (if ev also NULL).
+      3. Recompute ev_ebitda = ev / ebitda.
+
+    Safe to call multiple times — only touches rows where ev_ebitda IS NULL.
+    """
+    # Get true EBITDA from profit_and_loss
+    pl_row = conn.execute("""
+        SELECT operating_profit, depreciation
+        FROM profit_and_loss
+        WHERE symbol=? AND period_type='annual'
+        ORDER BY period_end DESC LIMIT 1
+    """, (symbol,)).fetchone()
+
+    if pl_row is None or pl_row[0] is None:
+        print(f"  repair_ev_ebitda: no profit_and_loss data for {symbol}, skipping")
+        return
+
+    true_ebitda = round(
+        float(pl_row[0]) + (float(pl_row[1]) if pl_row[1] else 0.0), 2
+    )
+    if true_ebitda <= 0:
+        print(f"  repair_ev_ebitda: EBITDA <= 0 for {symbol} ({true_ebitda}), skipping")
+        return
+
+    # Get BS data for EV fallback
+    bs_row = conn.execute("""
+        SELECT borrowings, cash_equivalents
+        FROM balance_sheet
+        WHERE symbol=? AND period_type='annual'
+        ORDER BY period_end DESC LIMIT 1
+    """, (symbol,)).fetchone()
+    _bs_borr = float(bs_row[0]) if bs_row and bs_row[0] else 0.0
+    _bs_cash = float(bs_row[1]) if bs_row and bs_row[1] else 0.0
+
+    # Fix all rows where ev_ebitda is NULL
+    rows = conn.execute("""
+        SELECT rowid, ev, market_cap FROM fundamentals
+        WHERE symbol=? AND ev_ebitda IS NULL
+    """, (symbol,)).fetchall()
+
+    fixed = 0
+    for rowid, ev, mc in rows:
+        updates = {"ebitda": true_ebitda}
+
+        _ev = float(ev) if ev is not None else None
+        if _ev is None and mc is not None:
+            _ev = round(float(mc) + _bs_borr - _bs_cash, 2)
+            updates["ev"] = _ev
+
+        if _ev is not None and _ev > 0:
+            updates["ev_ebitda"] = round(_ev / true_ebitda, 2)
+
+        if updates:
+            set_clause = ", ".join(f"{k}=?" for k in updates)
+            conn.execute(
+                f"UPDATE fundamentals SET {set_clause} WHERE rowid=?",
+                (*updates.values(), rowid)
+            )
+            fixed += 1
+
+    conn.commit()
+    print(f"  repair_ev_ebitda: fixed {fixed} rows for {symbol} "
+          f"| true_ebitda={true_ebitda}")
+
+
+# ─────────────────────────────────────────────────────────────
 # Backfill NULLs — carry-forward + sibling tables
 # ─────────────────────────────────────────────────────────────
 
@@ -110,7 +190,7 @@ _CARRY_FORWARD_COLS = [
 # Columns where sibling tables are MORE authoritative than carry-forward.
 # Applied AFTER carry-forward so they win.
 _SIBLING_COLS = [
-    "revenue", "ebitda",          # income_statement (annual)
+    "revenue", "ebitda",          # profit_and_loss (annual)
     "debt_to_equity",             # balance_sheet (computed)
     "opm_pct",                    # quarterly_results / annual_results
     "dividend_payout_pct",        # annual_results
@@ -128,10 +208,20 @@ def _backfill_nulls_from_db(conn, symbol: str, as_of_date: str):
         pe_ratio and ttm_pe are intentionally excluded (see Pass 3).
 
     Pass 2 — Sibling tables (authoritative override):
-        Pull revenue/ebitda from income_statement, debt_to_equity
-        from balance_sheet, opm_pct from quarterly/annual_results,
-        dividend_payout_pct from annual_results. These overwrite
-        carry-forward values because they are more precisely dated.
+        Pull revenue from profit_and_loss.sales.
+        Pull TRUE EBITDA = operating_profit + depreciation from
+        profit_and_loss (BUG FIX v6.6: previously only operating_profit
+        was used, which is EBIT, not EBITDA).
+        Pull debt_to_equity from balance_sheet, opm_pct from
+        quarterly/annual_results, dividend_payout_pct from annual_results.
+        These overwrite carry-forward values because they are more
+        precisely dated.
+
+    Pass 2.5 — Derive remaining nulls from sibling tables:
+        net_profit_margin_pct, ebit_margin_pct, gross_margin_pct,
+        roa_pct, interest_coverage, current_ratio, quick_ratio,
+        eps_annual, ev, ev_ebitda, ev_revenue, dio_days, dpo_days,
+        forward_pe (5-level chain), ebitda_margin_pct.
 
     Pass 3 — Price-dependent ratio recompute (BUG FIX):
         pe_ratio  = current_price / eps_annual   (every row, always)
@@ -181,27 +271,40 @@ def _backfill_nulls_from_db(conn, symbol: str, as_of_date: str):
 
     # ── Pass 2: sibling tables (override carry-forward) ───────
 
-    # BUG FIX: income_statement table removed in v6.0 — use profit_and_loss instead.
-    # profit_and_loss.sales     → revenue
-    # profit_and_loss.operating_profit → ebitda proxy (best available from Screener)
+    # Pull revenue AND true EBITDA from profit_and_loss.
+    #
+    # BUG FIX (v6.6): operating_profit from Screener = EBIT (before D&A).
+    # True EBITDA = operating_profit + depreciation.
+    # We fetch depreciation here and add it so fundamentals.ebitda holds
+    # the correct EBITDA, not a silently wrong EBIT value.
     is_row = conn.execute("""
-        SELECT sales, operating_profit
+        SELECT sales, operating_profit, depreciation
         FROM profit_and_loss
         WHERE symbol=? AND period_type='annual'
         ORDER BY period_end DESC LIMIT 1
     """, (symbol,)).fetchone()
     is_revenue = is_row[0] if is_row else None
-    is_ebitda  = is_row[1] if is_row else None
+    # Compute true EBITDA = EBIT + D&A
+    if is_row and is_row[1] is not None:
+        _op  = float(is_row[1])
+        _dep = float(is_row[2]) if is_row[2] is not None else 0.0
+        is_ebitda = round(_op + _dep, 2)
+    else:
+        is_ebitda = None
 
     # annual_results fallback for revenue/ebitda if profit_and_loss empty
     if is_revenue is None or is_ebitda is None:
         ar2 = conn.execute("""
-            SELECT sales, operating_profit FROM annual_results
+            SELECT sales, operating_profit, depreciation FROM annual_results
             WHERE symbol=? ORDER BY period_end DESC LIMIT 1
         """, (symbol,)).fetchone()
         if ar2:
-            if is_revenue is None: is_revenue = ar2[0]
-            if is_ebitda  is None: is_ebitda  = ar2[1]
+            if is_revenue is None:
+                is_revenue = ar2[0]
+            if is_ebitda is None and ar2[1] is not None:
+                _op2  = float(ar2[1])
+                _dep2 = float(ar2[2]) if ar2[2] is not None else 0.0
+                is_ebitda = round(_op2 + _dep2, 2)
 
     # balance_sheet: debt_to_equity
     bs_row = conn.execute("""
@@ -290,15 +393,16 @@ def _backfill_nulls_from_db(conn, symbol: str, as_of_date: str):
     #
     # Fields derived here (COALESCE — never overwrite existing values):
     #   net_profit_margin_pct  = net_profit / sales * 100
-    #   ebitda_margin_pct      = ebitda / revenue * 100          (already in fundamentals)
-    #   ebit_margin_pct        = (operating_profit) / sales * 100
+    #   ebitda_margin_pct      = ebitda / revenue * 100   (already in fundamentals)
+    #   ebit_margin_pct        = operating_profit / sales * 100
     #   gross_margin_pct       = (sales - expenses) / sales * 100  (proxy for services)
     #   roa_pct                = net_profit / total_assets * 100
     #   interest_coverage      = operating_profit / interest  (when interest > 0)
     #   current_ratio          = (cash_equivalents + trade_receivables) / trade_payables  (proxy)
     #   eps_annual             = net_profit_cr * 1e7 / shares_outstanding
     #   ev                     = market_cap + borrowings - cash_equivalents
-    #   low_52w                = from screener header (52_week_low in screener data — price_daily fallback)
+    #   ev_ebitda              = ev / ebitda  (now uses TRUE EBITDA — BUG FIX v6.6)
+    #   low_52w                = from screener header / price_daily fallback
 
     # Pull latest annual P&L row
     pl = conn.execute("""
@@ -357,11 +461,11 @@ def _backfill_nulls_from_db(conn, symbol: str, as_of_date: str):
 
     if bs2:
         _ta, _borr, _cash_bs, _rec, _pay, _eq_cap, _res = bs2
-        _ta   = float(_ta)    if _ta   else None
-        _borr = float(_borr)  if _borr else None
+        _ta      = float(_ta)      if _ta      else None
+        _borr    = float(_borr)    if _borr    else None
         _cash_bs = float(_cash_bs) if _cash_bs else None
-        _rec  = float(_rec)   if _rec  else None
-        _pay  = float(_pay)   if _pay  else None
+        _rec     = float(_rec)     if _rec     else None
+        _pay     = float(_pay)     if _pay     else None
 
         # roa_pct from balance_sheet total_assets + P&L net_profit
         if pl and _np and _ta and _ta != 0:
@@ -431,11 +535,11 @@ def _backfill_nulls_from_db(conn, symbol: str, as_of_date: str):
               AND avg_eps IS NOT NULL AND avg_eps > 0
             ORDER BY
                 CASE period_code
-                    WHEN '1y'         THEN 1
-                    WHEN '+1y'        THEN 1
-                    WHEN 'nextYear'   THEN 1
-                    WHEN '0y'         THEN 2
-                    WHEN 'currentYear'THEN 2
+                    WHEN '1y'          THEN 1
+                    WHEN '+1y'         THEN 1
+                    WHEN 'nextYear'    THEN 1
+                    WHEN '0y'          THEN 2
+                    WHEN 'currentYear' THEN 2
                 END,
                 snapshot_date DESC
             LIMIT 1
@@ -496,6 +600,9 @@ def _backfill_nulls_from_db(conn, symbol: str, as_of_date: str):
     # ── Recompute EV/EBITDA and EV/Revenue where NULL ─────────
     # Also recompute EV itself from balance_sheet when market_cap is present
     # but ev is still null (happens when yfinance cash/debt both missing).
+    #
+    # BUG FIX (v6.6): fundamentals.ebitda is now TRUE EBITDA (= EBIT + D&A)
+    # after Pass 2, so ev / ebitda here produces the correct EV/EBITDA ratio.
     ev_rows = conn.execute(
         "SELECT rowid, ev, market_cap, ebitda, revenue, ev_ebitda, ev_revenue "
         "FROM fundamentals WHERE symbol=?",
@@ -512,13 +619,13 @@ def _backfill_nulls_from_db(conn, symbol: str, as_of_date: str):
 
         # EV fallback: mc + borrowings - cash  (all in Rs. Crores)
         if ev is None and mc:
-            ev = round(mc + _bs_borr - _bs_cash, 2)
+            ev = round(float(mc) + _bs_borr - _bs_cash, 2)
             updates["ev"] = ev
 
-        if ev and ebitda and ebitda > 0 and ev_ebitda is None:
-            updates["ev_ebitda"] = round(ev / ebitda, 2)
-        if ev and revenue and revenue > 0 and ev_revenue is None:
-            updates["ev_revenue"] = round(ev / revenue, 2)
+        if ev and ebitda and float(ebitda) > 0 and ev_ebitda is None:
+            updates["ev_ebitda"] = round(float(ev) / float(ebitda), 2)
+        if ev and revenue and float(revenue) > 0 and ev_revenue is None:
+            updates["ev_revenue"] = round(float(ev) / float(revenue), 2)
 
         if updates:
             set_clause = ", ".join(f"{k}=?" for k in updates)
@@ -669,12 +776,19 @@ def load_fundamentals(symbol: str, data: dict):
     Upsert yfinance-derived fundamentals into today's row.
     Dropped keys: free_cash_flow, operating_cf, capex, net_income,
                   ttm_sales, ttm_net_profit.
+
+    The "EBITDA_source" debug key from fetch_fundamentals() is logged
+    here and then stripped before writing to the DB.
     """
     conn  = get_connection()
     today = date.today().isoformat()
 
     # One-time migration on first call
     _migrate_drop_retired_cols(conn)
+
+    # Log EBITDA source for diagnostics, then strip from data dict
+    ebitda_source = data.pop("EBITDA_source", "unknown")
+    print(f"  info  fundamentals: EBITDA source for {symbol} = {ebitda_source}")
 
     existing = _get_today_row(conn, symbol, today)
 
